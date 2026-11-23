@@ -1,5 +1,4 @@
 import { User } from 'firebase/auth';
-import { RepairTicket } from '../types/ticket';
 
 export type WebhookType = 'auto' | 'discord' | 'telegram' | 'custom';
 
@@ -70,7 +69,9 @@ export async function clearWebhookConfig(
   return data as WebhookStatusResponse;
 }
 
-export async function sendWebhookTest(user: User): Promise<{ ok: boolean; message: string }> {
+export async function sendWebhookTest(
+  user: User
+): Promise<{ ok: boolean; message: string }> {
   const headers = await getBearerHeader(user);
   const res = await fetch('/api/webhook/test', {
     method: 'POST',
@@ -86,22 +87,13 @@ export async function sendWebhookTest(user: User): Promise<{ ok: boolean; messag
 
 export async function notifyTicketWebhook(
   user: User,
-  ticket: RepairTicket
+  ticketId: string
 ): Promise<WebhookNotifyResponse> {
   const headers = await getBearerHeader(user);
   const res = await fetch('/api/webhook/notify', {
     method: 'POST',
     headers,
-    body: JSON.stringify({
-      id: ticket.id,
-      requesterName: ticket.requesterName,
-      department: ticket.department,
-      contactInfo: ticket.contactInfo,
-      category: ticket.category,
-      urgency: ticket.urgency,
-      assetTag: ticket.assetTag,
-      description: ticket.description,
-    }),
+    body: JSON.stringify({ ticketId }),
   });
 
   const data = await res.json();

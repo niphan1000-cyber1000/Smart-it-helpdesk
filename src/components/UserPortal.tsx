@@ -176,7 +176,7 @@ export function UserPortal({
     setSelfResolvedNotice(null);
 
     try {
-      const response = await requestUserTroubleshoot(category, description.trim());
+      const response = await requestUserTroubleshoot(user, category, description.trim());
       setAiResult({
         data: response.data,
         source: response.source,

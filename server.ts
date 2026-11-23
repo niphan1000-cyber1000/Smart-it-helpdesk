@@ -2,16 +2,21 @@ import 'dotenv/config';
 import express from 'express';
 import type { Request, Response } from 'express';
 import fs from 'node:fs';
-import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { GoogleGenAI, Type } from '@google/genai';
+import {
+  parseFirestoreTicketDocument,
+  SlidingWindowRateLimiter,
+  validateWebhookUrlAndResolve,
+} from './server/security.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PORT = Number(process.env.PORT) || 3000;
 const MODEL_NAME = 'gemini-2.5-flash';
 const ADMIN_EMAIL = 'niphan1000@gmail.com';
+const MAX_GEMINI_OUTPUT_TOKENS = 1024;
 
 type WebhookType = 'auto' | 'discord' | 'telegram' | 'custom';
 
@@ -31,6 +36,7 @@ interface VerifiedUser {
   uid: string;
   email: string;
   emailVerified: boolean;
+  idToken: string;
 }
 
 interface TicketWebhookPayload {
@@ -44,23 +50,50 @@ interface TicketWebhookPayload {
   description: string;
 }
 
-function loadFirebaseWebApiKey(): string {
+interface FirebaseAppletConfig {
+  projectId?: string;
+  apiKey?: string;
+  firestoreDatabaseId?: string;
+}
+
+function loadFirebaseConfig(): FirebaseAppletConfig {
   try {
     const configPath = path.resolve(__dirname, 'firebase-applet-config.json');
     if (fs.existsSync(configPath)) {
       const raw = fs.readFileSync(configPath, 'utf-8');
-      const parsed = JSON.parse(raw) as { apiKey?: string };
-      return parsed.apiKey || '';
+      return JSON.parse(raw) as FirebaseAppletConfig;
     }
   } catch {
     // Ignore missing config
   }
-  return '';
+  return {};
 }
 
-const FIREBASE_WEB_API_KEY = loadFirebaseWebApiKey();
+const FIREBASE_CONFIG = loadFirebaseConfig();
+const FIREBASE_WEB_API_KEY = FIREBASE_CONFIG.apiKey || '';
+const FIREBASE_PROJECT_ID = FIREBASE_CONFIG.projectId || '';
+const FIRESTORE_DATABASE_ID = FIREBASE_CONFIG.firestoreDatabaseId || '(default)';
+
+const ALLOWED_WEBHOOK_HOSTS = (process.env.WEBHOOK_ALLOWED_HOSTS || '')
+  .split(',')
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
+
+// Sliding-window rate limiters (15-minute window)
+const FIFTEEN_MIN_MS = 15 * 60 * 1000;
+const aiUidLimiter = new SlidingWindowRateLimiter(15, FIFTEEN_MIN_MS);
+const aiIpLimiter = new SlidingWindowRateLimiter(30, FIFTEEN_MIN_MS);
+const webhookUidLimiter = new SlidingWindowRateLimiter(10, FIFTEEN_MIN_MS);
 
 let runtimeWebhookConfig: { url: string; type: WebhookType } | null = null;
+
+function getClientIp(req: Request): string {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string' && forwarded.trim()) {
+    return forwarded.split(',')[0].trim();
+  }
+  return req.ip || 'unknown';
+}
 
 function getConfiguredApiKey(): string | null {
   const key = process.env.GEMINI_API_KEY?.trim();
@@ -79,68 +112,6 @@ function createGeminiClient(apiKey: string): GoogleGenAI {
       },
     },
   });
-}
-
-function isPrivateOrBlockedIp(ip: string): boolean {
-  if (net.isIPv4(ip)) {
-    const parts = ip.split('.').map((n) => parseInt(n, 10));
-    if (parts.length !== 4 || parts.some((n) => Number.isNaN(n))) return true;
-    const [a, b] = parts;
-    if (a === 10 || a === 127 || a === 0) return true;
-    if (a === 169 && b === 254) return true;
-    if (a === 172 && b >= 16 && b <= 31) return true;
-    if (a === 192 && b === 168) return true;
-    if (a === 100 && b >= 64 && b <= 127) return true;
-    return false;
-  }
-  if (net.isIPv6(ip)) {
-    const lower = ip.toLowerCase();
-    if (
-      lower === '::1' ||
-      lower === '::' ||
-      lower.startsWith('fc') ||
-      lower.startsWith('fd') ||
-      lower.startsWith('fe80')
-    ) {
-      return true;
-    }
-    return false;
-  }
-  return false;
-}
-
-function validateWebhookUrl(rawUrl: string): { valid: boolean; url?: URL; error?: string } {
-  const trimmed = rawUrl.trim();
-  if (!trimmed) {
-    return { valid: false, error: 'กรุณาระบุ Webhook URL' };
-  }
-  if (trimmed.length > 1000) {
-    return { valid: false, error: 'Webhook URL ยาวเกินกำหนด' };
-  }
-
-  let parsed: URL;
-  try {
-    parsed = new URL(trimmed);
-  } catch {
-    return { valid: false, error: 'รูปแบบ URL ไม่ถูกต้อง' };
-  }
-
-  if (parsed.protocol !== 'https:') {
-    return { valid: false, error: 'รองรับเฉพาะ Webhook URL แบบ HTTPS เพื่อความปลอดภัย' };
-  }
-
-  const host = parsed.hostname.toLowerCase();
-  if (
-    !host ||
-    host === 'localhost' ||
-    host.endsWith('.local') ||
-    host.endsWith('.internal') ||
-    isPrivateOrBlockedIp(host)
-  ) {
-    return { valid: false, error: 'ไม่อนุญาตให้ส่ง Webhook ไปยังเครือข่ายภายในหรือ Localhost' };
-  }
-
-  return { valid: true, url: parsed };
 }
 
 function maskWebhookUrl(rawUrl: string): string {
@@ -215,9 +186,9 @@ function buildWebhookBody(
           color,
           fields: [
             { name: 'ผู้แจ้ง', value: ticket.requesterName, inline: true },
-            { name: 'แผนก', value: ticket.department, inline: true },
-            { name: 'ความเร่งด่วน', value: ticket.urgency, inline: true },
-            { name: 'ติดต่อ', value: ticket.contactInfo, inline: true },
+            { name: 'แผนก', value: ticket.department || '-', inline: true },
+            { name: 'ความเร่งด่วน', value: ticket.urgency || '-', inline: true },
+            { name: 'ติดต่อ', value: ticket.contactInfo || '-', inline: true },
             { name: 'ครุภัณฑ์', value: ticket.assetTag || 'ไม่ระบุ', inline: true },
           ],
           timestamp: new Date().toISOString(),
@@ -229,10 +200,10 @@ function buildWebhookBody(
   if (targetKind === 'telegram') {
     const lines = [
       `<b>${escapeHtml(prefix)}แจ้งเตือนใบแจ้งซ่อมไอทีใหม่ (${escapeHtml(ticket.id)})</b>`,
-      `<b>ผู้แจ้ง:</b> ${escapeHtml(ticket.requesterName)} (แผนก${escapeHtml(ticket.department)})`,
-      `<b>ติดต่อ:</b> ${escapeHtml(ticket.contactInfo)}`,
-      `<b>ประเภท:</b> ${escapeHtml(ticket.category)}`,
-      `<b>ความเร่งด่วน:</b> ${escapeHtml(ticket.urgency)}`,
+      `<b>ผู้แจ้ง:</b> ${escapeHtml(ticket.requesterName)} (แผนก${escapeHtml(ticket.department || '-')})`,
+      `<b>ติดต่อ:</b> ${escapeHtml(ticket.contactInfo || '-')}`,
+      `<b>ประเภท:</b> ${escapeHtml(ticket.category || '-')}`,
+      `<b>ความเร่งด่วน:</b> ${escapeHtml(ticket.urgency || '-')}`,
       `<b>ครุภัณฑ์:</b> ${escapeHtml(ticket.assetTag || 'ไม่ระบุ')}`,
       `<b>อาการ:</b> ${escapeHtml(ticket.description)}`,
     ];
@@ -260,9 +231,9 @@ async function dispatchWebhook(
   ticket: TicketWebhookPayload,
   isTest = false
 ): Promise<void> {
-  const check = validateWebhookUrl(url);
+  const check = await validateWebhookUrlAndResolve(url, ALLOWED_WEBHOOK_HOSTS);
   if (!check.valid || !check.url) {
-    throw new Error(check.error || 'Webhook URL ไม่ถูกต้อง');
+    throw new Error(check.error || 'Webhook URL ไม่ผ่านการตรวจสอบความปลอดภัย');
   }
 
   const targetKind = detectWebhookType(check.url.toString(), configuredType);
@@ -275,8 +246,13 @@ async function dispatchWebhook(
       'User-Agent': 'it-helpdesk-webhook/1.0',
     },
     body: JSON.stringify(body),
+    redirect: 'manual',
     signal: AbortSignal.timeout(8000),
   });
+
+  if (response.status >= 300 && response.status < 400) {
+    throw new Error('ปลายทาง Webhook พยายาม Redirect ซึ่งถูกปฏิเสธเพื่อความปลอดภัย');
+  }
 
   if (!response.ok) {
     throw new Error(`ปลายทาง Webhook ตอบกลับสถานะ HTTP ${response.status}`);
@@ -316,10 +292,87 @@ async function verifyFirebaseBearerToken(req: Request): Promise<VerifiedUser | n
       uid: user.localId,
       email: user.email,
       emailVerified: Boolean(user.emailVerified),
+      idToken,
     };
   } catch {
     return null;
   }
+}
+
+async function isAdminUser(user: VerifiedUser): Promise<boolean> {
+  if (!user.emailVerified) return false;
+  if (user.email === ADMIN_EMAIL) return true;
+  if (!FIREBASE_PROJECT_ID) return false;
+
+  try {
+    const adminDocUrl = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
+      FIREBASE_PROJECT_ID
+    )}/databases/${encodeURIComponent(FIRESTORE_DATABASE_ID)}/documents/admins/${encodeURIComponent(
+      user.uid
+    )}`;
+    const res = await fetch(adminDocUrl, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${user.idToken}`,
+      },
+      signal: AbortSignal.timeout(5000),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function fetchFirestoreTicketAsUser(
+  ticketId: string,
+  idToken: string
+): Promise<{ status: number; ticket: ReturnType<typeof parseFirestoreTicketDocument> }> {
+  if (!FIREBASE_PROJECT_ID) {
+    return { status: 500, ticket: null };
+  }
+
+  const docUrl = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
+    FIREBASE_PROJECT_ID
+  )}/databases/${encodeURIComponent(FIRESTORE_DATABASE_ID)}/documents/tickets/${encodeURIComponent(
+    ticketId
+  )}`;
+
+  const res = await fetch(docUrl, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bearer ${idToken}`,
+    },
+    signal: AbortSignal.timeout(6000),
+  });
+
+  if (!res.ok) {
+    return { status: res.status, ticket: null };
+  }
+
+  const json = await res.json();
+  return { status: 200, ticket: parseFirestoreTicketDocument(json) };
+}
+
+function enforceAiRateLimit(user: VerifiedUser, req: Request, res: Response): boolean {
+  const uidCheck = aiUidLimiter.check(`ai:uid:${user.uid}`);
+  if (!uidCheck.allowed) {
+    res.setHeader('Retry-After', String(uidCheck.retryAfterSeconds));
+    res.status(429).json({
+      error: `คุณใช้งาน AI เกินโควตาชั่วคราว กรุณารอ ${uidCheck.retryAfterSeconds} วินาทีแล้วลองใหม่`,
+    });
+    return false;
+  }
+
+  const ipCheck = aiIpLimiter.check(`ai:ip:${getClientIp(req)}`);
+  if (!ipCheck.allowed) {
+    res.setHeader('Retry-After', String(ipCheck.retryAfterSeconds));
+    res.status(429).json({
+      error: `มีการเรียกใช้งาน AI จากเครือข่ายนี้จำนวนมากเกินไป กรุณารอ ${ipCheck.retryAfterSeconds} วินาที`,
+    });
+    return false;
+  }
+
+  return true;
 }
 
 function buildFallbackTroubleshoot(category: string, description: string): TroubleshootData {
@@ -503,20 +556,32 @@ function getSafeErrorMessage(err: unknown): { status: number; message: string } 
 
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: '1mb' }));
+  app.use(express.json({ limit: '256kb' }));
 
-  app.get('/api/ai/status', (_req: Request, res: Response) => {
-    const configured = Boolean(getConfiguredApiKey());
+  app.get('/api/ai/status', async (req: Request, res: Response) => {
+    const user = await verifyFirebaseBearerToken(req);
+    if (!user) {
+      res.status(401).json({ error: 'กรุณาเข้าสู่ระบบก่อนตรวจสอบสถานะ' });
+      return;
+    }
     res.json({
-      configured,
+      configured: Boolean(getConfiguredApiKey()),
       model: MODEL_NAME,
     });
   });
 
-  // User Portal: AI Troubleshooting Assistant
+  // User Portal: AI Troubleshooting Assistant (Authenticated + Rate-limited)
   app.post('/api/ai/troubleshoot', async (req: Request, res: Response) => {
-    const category = typeof req.body?.category === 'string' ? req.body.category.trim() : '';
-    const description = typeof req.body?.description === 'string' ? req.body.description.trim() : '';
+    const user = await verifyFirebaseBearerToken(req);
+    if (!user) {
+      res.status(401).json({ error: 'กรุณาเข้าสู่ระบบด้วยบัญชี Google ก่อนใช้งานผู้ช่วย AI' });
+      return;
+    }
+
+    if (!enforceAiRateLimit(user, req, res)) return;
+
+    const category = typeof req.body?.category === 'string' ? req.body.category.trim().slice(0, 100) : '';
+    const description = typeof req.body?.description === 'string' ? req.body.description.trim().slice(0, 2000) : '';
 
     if (!category || !description) {
       res.status(400).json({
@@ -543,8 +608,9 @@ async function startServer() {
         model: MODEL_NAME,
         contents: `ประเภทปัญหา: ${category}\nรายละเอียดอาการเสียจากผู้ใช้งาน: ${description}`,
         config: {
+          maxOutputTokens: MAX_GEMINI_OUTPUT_TOKENS,
           systemInstruction:
-            'คุณคือผู้ช่วยฝ่ายไอที (IT Helpdesk) ที่สุภาพและใจดี หน้าที่ของคุณคือช่วยพนักงานออฟฟิศทั่วไปแก้ปัญหาเบื้องต้นด้วยตนเองก่อนส่งซ่อม ตอบเป็นภาษาไทยที่เข้าใจง่าย หลีกเลี่ยงศัพท์เทคนิคที่ซับซ้อน แบ่งขั้นตอนเป็นข้อๆ ที่ทำตามได้จริงและปลอดภัย ไม่เสี่ยงทำให้อุปกรณ์เสียหาย',
+            'คุณคือผู้ช่วยฝ่ายไอที (IT Helpdesk) ที่สุภาพและใจดี หน้าที่ของคุณคือช่วยพนักงานออฟฟิศทั่วไปแก้ปัญหาเบื้องต้นด้วยตนเองก่อนส่งซ่อม ตอบเป็นภาษาไทยที่เข้าใจง่าย หลีกเลี่ยงศัพท์เทคนิคที่ซับซ้อน แบ่งขั้นตอนเป็นข้อๆ ไม่เกิน 5 ข้อ ที่ทำตามได้จริงและปลอดภัย ไม่เสี่ยงทำให้อุปกรณ์เสียหาย',
           responseMimeType: 'application/json',
           responseSchema: {
             type: Type.OBJECT,
@@ -572,9 +638,10 @@ async function startServer() {
       const parsed = JSON.parse(rawText) as Partial<TroubleshootData>;
       const data: TroubleshootData = {
         summary: parsed.summary || 'ลองตรวจสอบตามขั้นตอนเบื้องต้นด้านล่างนี้ก่อนแจ้งช่างครับ',
-        steps: Array.isArray(parsed.steps) && parsed.steps.length > 0
-          ? parsed.steps
-          : buildFallbackTroubleshoot(category, description).steps,
+        steps:
+          Array.isArray(parsed.steps) && parsed.steps.length > 0
+            ? parsed.steps.slice(0, 5)
+            : buildFallbackTroubleshoot(category, description).steps,
         warningNote: parsed.warningNote || 'กรุณาบันทึกงานสำคัญก่อนรีสตาร์ทเครื่องทุกครั้งครับ',
       };
 
@@ -589,14 +656,28 @@ async function startServer() {
     }
   });
 
-  // IT Admin Dashboard: Deep Technical Diagnostic
+  // IT Admin Dashboard: Deep Technical Diagnostic (Admin-only + Rate-limited)
   app.post('/api/ai/diagnostic', async (req: Request, res: Response) => {
-    const ticketId = typeof req.body?.ticketId === 'string' ? req.body.ticketId.trim() : '';
-    const category = typeof req.body?.category === 'string' ? req.body.category.trim() : '';
-    const description = typeof req.body?.description === 'string' ? req.body.description.trim() : '';
-    const urgency = typeof req.body?.urgency === 'string' ? req.body.urgency.trim() : '';
-    const assetTag = typeof req.body?.assetTag === 'string' ? req.body.assetTag.trim() : '';
-    const department = typeof req.body?.department === 'string' ? req.body.department.trim() : '';
+    const user = await verifyFirebaseBearerToken(req);
+    if (!user) {
+      res.status(401).json({ error: 'กรุณาเข้าสู่ระบบก่อนใช้งานการวิเคราะห์เชิงลึก' });
+      return;
+    }
+
+    const adminAuthorized = await isAdminUser(user);
+    if (!adminAuthorized) {
+      res.status(403).json({ error: 'สิทธิ์การใช้งานการวิเคราะห์เชิงลึกสงวนไว้สำหรับเจ้าหน้าที่ไอที (IT Admin) เท่านั้น' });
+      return;
+    }
+
+    if (!enforceAiRateLimit(user, req, res)) return;
+
+    const ticketId = typeof req.body?.ticketId === 'string' ? req.body.ticketId.trim().slice(0, 32) : '';
+    const category = typeof req.body?.category === 'string' ? req.body.category.trim().slice(0, 100) : '';
+    const description = typeof req.body?.description === 'string' ? req.body.description.trim().slice(0, 2000) : '';
+    const urgency = typeof req.body?.urgency === 'string' ? req.body.urgency.trim().slice(0, 60) : '';
+    const assetTag = typeof req.body?.assetTag === 'string' ? req.body.assetTag.trim().slice(0, 64) : '';
+    const department = typeof req.body?.department === 'string' ? req.body.department.trim().slice(0, 40) : '';
 
     if (!category || !description) {
       res.status(400).json({ error: 'ข้อมูลใบแจ้งซ่อมไม่ครบถ้วนสำหรับการวิเคราะห์' });
@@ -630,6 +711,7 @@ async function startServer() {
         model: MODEL_NAME,
         contents: prompt,
         config: {
+          maxOutputTokens: MAX_GEMINI_OUTPUT_TOKENS,
           systemInstruction:
             'คุณคือหัวหน้าทีมวิศวกรฝ่ายซ่อมบำรุงไอที (Senior IT Support Engineer) วิเคราะห์ใบแจ้งซ่อมในมุมมองช่างเทคนิคเพื่อเตรียมความพร้อมก่อนเข้าหน้างาน สรุปสั้น กระชับ ตรงประเด็น 3 หัวข้อ: (1) สาเหตุหลักที่เป็นไปได้ (Root Cause) (2) รายการอุปกรณ์/อะไหล่/โปรแกรมที่ช่างควรเตรียมไปหน้างาน (3) แนวทางการแก้ไขระดับเทคนิคแบบเป็นขั้นตอน',
           responseMimeType: 'application/json',
@@ -663,11 +745,11 @@ async function startServer() {
         rootCause: parsed.rootCause || fallback.rootCause,
         toolsAndParts:
           Array.isArray(parsed.toolsAndParts) && parsed.toolsAndParts.length > 0
-            ? parsed.toolsAndParts
+            ? parsed.toolsAndParts.slice(0, 6)
             : fallback.toolsAndParts,
         technicalSteps:
           Array.isArray(parsed.technicalSteps) && parsed.technicalSteps.length > 0
-            ? parsed.technicalSteps
+            ? parsed.technicalSteps.slice(0, 6)
             : fallback.technicalSteps,
       };
 
@@ -685,7 +767,11 @@ async function startServer() {
   // Webhook Status (Admin only)
   app.get('/api/webhook/status', async (req: Request, res: Response) => {
     const user = await verifyFirebaseBearerToken(req);
-    if (!user || user.email !== ADMIN_EMAIL) {
+    if (!user) {
+      res.status(401).json({ error: 'กรุณาเข้าสู่ระบบ' });
+      return;
+    }
+    if (!(await isAdminUser(user))) {
       res.status(403).json({ error: 'เฉพาะเจ้าหน้าที่ไอทีผู้ดูแลระบบเท่านั้น' });
       return;
     }
@@ -702,7 +788,11 @@ async function startServer() {
   // Configure runtime Webhook URL (Admin only, stored server-side)
   app.post('/api/webhook/config', async (req: Request, res: Response) => {
     const user = await verifyFirebaseBearerToken(req);
-    if (!user || user.email !== ADMIN_EMAIL) {
+    if (!user) {
+      res.status(401).json({ error: 'กรุณาเข้าสู่ระบบ' });
+      return;
+    }
+    if (!(await isAdminUser(user))) {
       res.status(403).json({ error: 'เฉพาะเจ้าหน้าที่ไอทีผู้ดูแลระบบเท่านั้น' });
       return;
     }
@@ -726,9 +816,9 @@ async function startServer() {
       return;
     }
 
-    const check = validateWebhookUrl(url);
+    const check = await validateWebhookUrlAndResolve(url, ALLOWED_WEBHOOK_HOSTS);
     if (!check.valid || !check.url) {
-      res.status(400).json({ error: check.error || 'Webhook URL ไม่ถูกต้อง' });
+      res.status(400).json({ error: check.error || 'Webhook URL ไม่ผ่านการตรวจสอบความปลอดภัย' });
       return;
     }
 
@@ -745,7 +835,11 @@ async function startServer() {
   // Send Test Webhook (Admin only)
   app.post('/api/webhook/test', async (req: Request, res: Response) => {
     const user = await verifyFirebaseBearerToken(req);
-    if (!user || user.email !== ADMIN_EMAIL) {
+    if (!user) {
+      res.status(401).json({ error: 'กรุณาเข้าสู่ระบบ' });
+      return;
+    }
+    if (!(await isAdminUser(user))) {
       res.status(403).json({ error: 'เฉพาะเจ้าหน้าที่ไอทีผู้ดูแลระบบเท่านั้น' });
       return;
     }
@@ -780,11 +874,20 @@ async function startServer() {
     }
   });
 
-  // Notify Webhook on New Repair Ticket (Any authenticated verified employee)
+  // Notify Webhook on New Repair Ticket (Verified against Firestore Ticket Ownership + Rate-limited)
   app.post('/api/webhook/notify', async (req: Request, res: Response) => {
     const user = await verifyFirebaseBearerToken(req);
     if (!user) {
       res.status(401).json({ error: 'กรุณาเข้าสู่ระบบก่อนส่งการแจ้งเตือน' });
+      return;
+    }
+
+    const rateCheck = webhookUidLimiter.check(`webhook:uid:${user.uid}`);
+    if (!rateCheck.allowed) {
+      res.setHeader('Retry-After', String(rateCheck.retryAfterSeconds));
+      res.status(429).json({
+        error: `ส่งการแจ้งเตือนถี่เกินไป กรุณารอ ${rateCheck.retryAfterSeconds} วินาที`,
+      });
       return;
     }
 
@@ -794,24 +897,49 @@ async function startServer() {
       return;
     }
 
-    const ticket: TicketWebhookPayload = {
-      id: typeof req.body?.id === 'string' ? req.body.id.slice(0, 32) : '',
-      requesterName: typeof req.body?.requesterName === 'string' ? req.body.requesterName.slice(0, 100) : '',
-      department: typeof req.body?.department === 'string' ? req.body.department.slice(0, 40) : '',
-      contactInfo: typeof req.body?.contactInfo === 'string' ? req.body.contactInfo.slice(0, 120) : '',
-      category: typeof req.body?.category === 'string' ? req.body.category.slice(0, 100) : '',
-      urgency: typeof req.body?.urgency === 'string' ? req.body.urgency.slice(0, 60) : '',
-      assetTag: typeof req.body?.assetTag === 'string' ? req.body.assetTag.slice(0, 64) : '',
-      description: typeof req.body?.description === 'string' ? req.body.description.slice(0, 2000) : '',
-    };
+    const ticketId = typeof req.body?.ticketId === 'string' ? req.body.ticketId.trim() : '';
+    if (!/^IT-[0-9]{4}-[0-9]{3,6}$/.test(ticketId)) {
+      res.status(400).json({ error: 'รหัสใบแจ้งซ่อมไม่ถูกต้อง' });
+      return;
+    }
 
-    if (!ticket.id || !ticket.requesterName || !ticket.description) {
-      res.status(400).json({ error: 'ข้อมูลใบแจ้งซ่อมไม่ครบถ้วน' });
+    // Fetch authoritative ticket directly from Firestore using caller's ID Token (Firestore Rules enforced)
+    const { status: fsStatus, ticket: verifiedTicket } = await fetchFirestoreTicketAsUser(
+      ticketId,
+      user.idToken
+    );
+
+    if (fsStatus === 404) {
+      res.status(404).json({ error: 'ไม่พบใบแจ้งซ่อมนี้ในฐานข้อมูล' });
+      return;
+    }
+    if (fsStatus === 403 || !verifiedTicket) {
+      res.status(403).json({ error: 'ไม่มีสิทธิ์ส่งการแจ้งเตือนสำหรับใบแจ้งซ่อมนี้' });
+      return;
+    }
+
+    const callerIsOwner = verifiedTicket.createdByUid === user.uid;
+    if (!callerIsOwner && !(await isAdminUser(user))) {
+      res.status(403).json({ error: 'ไม่มีสิทธิ์ส่งการแจ้งเตือนสำหรับใบงานของผู้อื่น' });
       return;
     }
 
     try {
-      await dispatchWebhook(effective.url, effective.type, ticket, false);
+      await dispatchWebhook(
+        effective.url,
+        effective.type,
+        {
+          id: verifiedTicket.id,
+          requesterName: verifiedTicket.requesterName,
+          department: verifiedTicket.department,
+          contactInfo: verifiedTicket.contactInfo,
+          category: verifiedTicket.category,
+          urgency: verifiedTicket.urgency,
+          assetTag: verifiedTicket.assetTag,
+          description: verifiedTicket.description,
+        },
+        false
+      );
       res.json({ sent: true });
     } catch (err) {
       res.status(502).json({

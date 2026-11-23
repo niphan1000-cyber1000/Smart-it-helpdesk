@@ -33,13 +33,21 @@ service cloud.firestore {
       );
     }
 
+    function isValidStepElement(steps, idx) {
+      return steps.size() <= idx || (steps[idx] is string && steps[idx].size() >= 1 && steps[idx].size() <= 600);
+    }
+
     function isValidAiTroubleshooting(ai) {
       return ai is map
         && ai.keys().hasAll(['summary', 'steps', 'warningNote', 'source', 'triedAt'])
         && ai.keys().hasOnly(['summary', 'steps', 'warningNote', 'source', 'triedAt'])
         && ai.summary is string && ai.summary.size() <= 1000
-        && ai.steps is list && ai.steps.size() >= 1 && ai.steps.size() <= 10
-        && ai.steps[0] is string && ai.steps[0].size() <= 600
+        && ai.steps is list && ai.steps.size() >= 1 && ai.steps.size() <= 5
+        && isValidStepElement(ai.steps, 0)
+        && isValidStepElement(ai.steps, 1)
+        && isValidStepElement(ai.steps, 2)
+        && isValidStepElement(ai.steps, 3)
+        && isValidStepElement(ai.steps, 4)
         && ai.warningNote is string && ai.warningNote.size() <= 600
         && ai.source in ['gemini', 'fallback']
         && ai.triedAt is string && ai.triedAt.size() <= 64;
@@ -105,6 +113,15 @@ service cloud.firestore {
         && (!('aiTroubleshooting' in data) || data.aiTroubleshooting == null || isValidAiTroubleshooting(data.aiTroubleshooting));
     }
 
+    function isValidCounter(data) {
+      return data.keys().hasAll(['lastNumber', 'updatedAt'])
+        && data.keys().hasOnly(['lastNumber', 'updatedAt'])
+        && data.lastNumber is int
+        && data.lastNumber >= 1
+        && data.lastNumber <= 999999
+        && data.updatedAt is timestamp;
+    }
+
     function isValidAiResolution(data) {
       return data.keys().hasAll(['category', 'createdByUid', 'createdAt'])
         && data.keys().hasOnly(['category', 'createdByUid', 'createdAt'])
@@ -128,9 +145,27 @@ service cloud.firestore {
         && data.createdAt is timestamp;
     }
 
+    function isValidAuditLog(data) {
+      return data.keys().hasAll(['action', 'targetId', 'actorUid', 'actorEmail', 'summary', 'createdAt'])
+        && data.keys().hasOnly(['action', 'targetId', 'actorUid', 'actorEmail', 'summary', 'createdAt'])
+        && data.action in [
+          'ticket.created',
+          'ticket.updated',
+          'ticket.deleted',
+          'ai.self_resolved',
+          'admin.demo_seeded',
+          'webhook.config_updated'
+        ]
+        && data.targetId is string && data.targetId.size() >= 1 && data.targetId.size() <= 128
+        && data.actorUid is string && data.actorUid.size() >= 1 && data.actorUid.size() <= 128
+        && data.actorEmail is string && data.actorEmail.size() >= 3 && data.actorEmail.size() <= 160
+        && data.summary is string && data.summary.size() >= 1 && data.summary.size() <= 500
+        && data.createdAt is timestamp;
+    }
+
     match /tickets/{ticketId} {
       allow get: if isSignedIn() && isValidId(ticketId) && (existing().createdByUid == request.auth.uid || isAdmin());
-      allow list: if isSignedIn() && (resource.data.createdByUid == request.auth.uid || isBootstrappedAdmin());
+      allow list: if isSignedIn() && (resource.data.createdByUid == request.auth.uid || isAdmin());
 
       allow create: if isSignedIn()
         && isValidId(ticketId)
@@ -140,7 +175,8 @@ service cloud.firestore {
         && incoming().createdByEmail == request.auth.token.email
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time
-        && (incoming().status == 'รอดำเนินการ' || isAdmin());
+        && (incoming().status == 'รอดำเนินการ' || isAdmin())
+        && existsAfter(/databases/$(database)/documents/counters/tickets);
 
       allow update: if isSignedIn()
         && isValidId(ticketId)
@@ -156,9 +192,25 @@ service cloud.firestore {
       allow delete: if isSignedIn() && isValidId(ticketId) && isAdmin();
     }
 
+    match /counters/{counterId} {
+      allow get: if isSignedIn() && counterId == 'tickets';
+      allow list: if false;
+      allow create: if isSignedIn()
+        && counterId == 'tickets'
+        && isValidCounter(incoming())
+        && incoming().updatedAt == request.time
+        && (incoming().lastNumber == 1 || isAdmin());
+      allow update: if isSignedIn()
+        && counterId == 'tickets'
+        && isValidCounter(incoming())
+        && incoming().updatedAt == request.time
+        && (incoming().lastNumber == existing().lastNumber + 1 || (isAdmin() && incoming().lastNumber >= existing().lastNumber));
+      allow delete: if false;
+    }
+
     match /aiResolutions/{resolutionId} {
       allow get: if isSignedIn() && isValidId(resolutionId) && (existing().createdByUid == request.auth.uid || isAdmin());
-      allow list: if isSignedIn() && (resource.data.createdByUid == request.auth.uid || isBootstrappedAdmin());
+      allow list: if isSignedIn() && (resource.data.createdByUid == request.auth.uid || isAdmin());
 
       allow create: if isSignedIn()
         && isValidId(resolutionId)
@@ -171,14 +223,26 @@ service cloud.firestore {
 
     match /admins/{uid} {
       allow get: if isSignedIn() && isValidId(uid) && (request.auth.uid == uid || isAdmin());
-      allow list: if isBootstrappedAdmin();
+      allow list: if isAdmin();
       allow create: if isSignedIn()
         && isValidId(uid)
         && isAdmin()
         && isValidAdminUser(incoming())
         && incoming().addedByUid == request.auth.uid
         && incoming().createdAt == request.time;
-      allow update, delete: if isSignedIn() && isValidId(uid) && isBootstrappedAdmin();
+      allow update, delete: if isSignedIn() && isValidId(uid) && isAdmin();
+    }
+
+    match /auditLogs/{logId} {
+      allow get: if isSignedIn() && isValidId(logId) && isAdmin();
+      allow list: if isAdmin();
+      allow create: if isSignedIn()
+        && isValidId(logId)
+        && isValidAuditLog(incoming())
+        && incoming().actorUid == request.auth.uid
+        && incoming().actorEmail == request.auth.token.email
+        && incoming().createdAt == request.time;
+      allow update, delete: if false;
     }
   }
 }

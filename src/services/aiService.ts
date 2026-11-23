@@ -1,3 +1,4 @@
+import { User } from 'firebase/auth';
 import {
   AiDiagnosticResult,
   AiTroubleshootResult,
@@ -12,13 +13,23 @@ export interface AiApiResponse<T> {
   data: T;
 }
 
+async function getBearerHeaders(user: User): Promise<Record<string, string>> {
+  const token = await user.getIdToken();
+  return {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${token}`,
+  };
+}
+
 export async function requestUserTroubleshoot(
+  user: User,
   category: ProblemCategory,
   description: string
 ): Promise<AiApiResponse<AiTroubleshootResult>> {
+  const headers = await getBearerHeaders(user);
   const response = await fetch('/api/ai/troubleshoot', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify({ category, description }),
   });
 
@@ -34,11 +45,13 @@ export async function requestUserTroubleshoot(
 }
 
 export async function requestTechDiagnostic(
+  user: User,
   ticket: RepairTicket
 ): Promise<AiApiResponse<AiDiagnosticResult>> {
+  const headers = await getBearerHeaders(user);
   const response = await fetch('/api/ai/diagnostic', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify({
       ticketId: ticket.id,
       category: ticket.category,

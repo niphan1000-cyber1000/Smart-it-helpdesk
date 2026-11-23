@@ -15,12 +15,13 @@ import { AdminDashboard } from './components/AdminDashboard';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { auth, signInWithGoogle, signOutUser } from './firebase';
 import {
-  checkIsAdminUser,
   createTicketInFirestore,
   deleteTicketInFirestore,
   logAiSelfResolutionInFirestore,
+  resolveUserAccess,
   seedDemoTicketsToFirestore,
   subscribeToAiResolutionsCount,
+  subscribeToAuditLogs,
   subscribeToTickets,
   updateTicketInFirestore,
 } from './services/ticketService';
@@ -30,7 +31,11 @@ import {
 } from './services/webhookService';
 import {
   AppViewMode,
+  AuditLogEntry,
+  getPermissionsForRole,
+  hasPermission,
   NewTicketInput,
+  Permission,
   ProblemCategory,
   RepairTicket,
   TicketStatus,
@@ -41,9 +46,12 @@ export default function App() {
   const [activeMode, setActiveMode] = useState<AppViewMode>('user');
   const [user, setUser] = useState<User | null>(null);
   const [authReady, setAuthReady] = useState(false);
-  const [isAdmin, setIsAdmin] = useState(false);
+  const [permissions, setPermissions] = useState<Permission[]>(() =>
+    getPermissionsForRole('employee')
+  );
 
   const [tickets, setTickets] = useState<RepairTicket[]>([]);
+  const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([]);
   const [ticketsLoading, setTicketsLoading] = useState(true);
   const [aiSelfResolvedCount, setAiSelfResolvedCount] = useState(0);
   const [webhookConfigured, setWebhookConfigured] = useState(false);
@@ -56,14 +64,14 @@ export default function App() {
     setToastMessage(message);
   }, []);
 
-  // Firebase Auth listener
+  // Firebase Auth listener + standardized RBAC resolution
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (nextUser) => {
       setUser(nextUser);
       if (nextUser) {
-        const adminFlag = await checkIsAdminUser(nextUser);
-        setIsAdmin(adminFlag);
-        if (adminFlag) {
+        const access = await resolveUserAccess(nextUser);
+        setPermissions(access.permissions);
+        if (hasPermission(access.permissions, 'webhook:manage')) {
           fetchWebhookStatus(nextUser)
             .then((res) => setWebhookConfigured(res.configured))
             .catch(() => {});
@@ -71,8 +79,9 @@ export default function App() {
           setWebhookConfigured(false);
         }
       } else {
-        setIsAdmin(false);
+        setPermissions(getPermissionsForRole('employee'));
         setTickets([]);
+        setAuditLogs([]);
         setAiSelfResolvedCount(0);
         setTicketsLoading(false);
       }
@@ -81,17 +90,17 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
-  // Real-time Firestore listeners (active only when authenticated)
+  // Real-time Firestore listeners (unified RBAC permissions)
   useEffect(() => {
     if (!authReady || !user) return;
     setTicketsLoading(true);
 
-    const isBootstrappedAdmin =
-      Boolean(user.emailVerified) && user.email === 'niphan1000@gmail.com';
+    const canReadAll = hasPermission(permissions, 'ticket:read_all');
+    const canReadAudit = hasPermission(permissions, 'audit:read');
 
     const unsubTickets = subscribeToTickets(
       user,
-      isBootstrappedAdmin && isAdmin,
+      canReadAll,
       (list) => {
         setTickets(list);
         setTicketsLoading(false);
@@ -104,15 +113,20 @@ export default function App() {
 
     const unsubAiStats = subscribeToAiResolutionsCount(
       user,
-      isBootstrappedAdmin && isAdmin,
+      canReadAll,
       (count) => setAiSelfResolvedCount(count)
     );
+
+    const unsubAudit = canReadAudit
+      ? subscribeToAuditLogs((logs) => setAuditLogs(logs))
+      : () => {};
 
     return () => {
       unsubTickets();
       unsubAiStats();
+      unsubAudit();
     };
-  }, [authReady, user, isAdmin, showToast]);
+  }, [authReady, user, permissions, showToast]);
 
   useEffect(() => {
     if (!toastMessage) return;
@@ -148,12 +162,12 @@ export default function App() {
       throw new Error('กรุณาเข้าสู่ระบบก่อนส่งใบแจ้งซ่อม');
     }
 
-    const created = await createTicketInFirestore(user, input, tickets);
+    const created = await createTicketInFirestore(user, input);
 
-    // Fire instant Webhook notification in the background
+    // Notify Webhook server-side using verified ticketId only
     let webhookNote = '';
     try {
-      const hookResult = await notifyTicketWebhook(user, created);
+      const hookResult = await notifyTicketWebhook(user, created.id);
       if (hookResult.sent) {
         webhookNote = ' และส่งแจ้งเตือน Webhook แล้ว';
       }
@@ -175,8 +189,10 @@ export default function App() {
     ticketId: string,
     updates: { status: TicketStatus; resolutionNote: string }
   ) => {
+    if (!user) return;
     const target = tickets.find((t) => t.id === ticketId);
     await updateTicketInFirestore(
+      user,
       ticketId,
       updates,
       target?.completedAt ?? null
@@ -185,7 +201,8 @@ export default function App() {
   };
 
   const handleDeleteTicket = async (ticketId: string) => {
-    await deleteTicketInFirestore(ticketId);
+    if (!user) return;
+    await deleteTicketInFirestore(user, ticketId);
     showToast(`ลบใบแจ้งซ่อม ${ticketId} แล้ว`);
   };
 
@@ -287,8 +304,9 @@ export default function App() {
           ) : (
             <AdminDashboard
               user={user}
-              isAdmin={isAdmin}
+              permissions={permissions}
               tickets={tickets}
+              auditLogs={auditLogs}
               ticketsLoading={ticketsLoading}
               aiSelfResolvedCount={aiSelfResolvedCount}
               webhookConfigured={webhookConfigured}

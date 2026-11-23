@@ -39,6 +39,63 @@ export type TicketStatus = (typeof TICKET_STATUSES)[number];
 
 export type AppViewMode = 'user' | 'admin';
 
+export type UserRole = 'admin' | 'employee';
+
+export type Permission =
+  | 'ticket:read_all'
+  | 'ticket:read_own'
+  | 'ticket:create'
+  | 'ticket:update'
+  | 'ticket:delete'
+  | 'ai:troubleshoot'
+  | 'ai:diagnostic'
+  | 'webhook:manage'
+  | 'audit:read';
+
+const ROLE_PERMISSIONS: Record<UserRole, readonly Permission[]> = {
+  admin: [
+    'ticket:read_all',
+    'ticket:read_own',
+    'ticket:create',
+    'ticket:update',
+    'ticket:delete',
+    'ai:troubleshoot',
+    'ai:diagnostic',
+    'webhook:manage',
+    'audit:read',
+  ],
+  employee: ['ticket:read_own', 'ticket:create', 'ai:troubleshoot'],
+};
+
+export function getPermissionsForRole(role: UserRole): Permission[] {
+  return [...ROLE_PERMISSIONS[role]];
+}
+
+export function hasPermission(
+  permissions: readonly Permission[],
+  permission: Permission
+): boolean {
+  return permissions.includes(permission);
+}
+
+export type AuditAction =
+  | 'ticket.created'
+  | 'ticket.updated'
+  | 'ticket.deleted'
+  | 'ai.self_resolved'
+  | 'admin.demo_seeded'
+  | 'webhook.config_updated';
+
+export interface AuditLogEntry {
+  id: string;
+  action: AuditAction;
+  targetId: string;
+  actorUid: string;
+  actorEmail: string;
+  summary: string;
+  createdAt: string;
+}
+
 export interface AiTroubleshootResult {
   summary: string;
   steps: string[];

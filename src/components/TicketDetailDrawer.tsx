@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { User } from 'firebase/auth';
 import {
   AlertCircle,
   Bot,
@@ -21,6 +22,7 @@ import { requestTechDiagnostic } from '../services/aiService';
 import { StatusIndicator, UrgencyIndicator } from './StatusIndicator';
 
 interface TicketDetailDrawerProps {
+  user: User;
   ticket: RepairTicket | null;
   onClose: () => void;
   onUpdateTicket: (
@@ -39,6 +41,7 @@ const QUICK_RESOLUTION_TEMPLATES = [
 ];
 
 export function TicketDetailDrawer({
+  user,
   ticket,
   onClose,
   onUpdateTicket,
@@ -85,7 +88,7 @@ export function TicketDetailDrawer({
     setDiagLoading(true);
     setDiagError(null);
     try {
-      const response = await requestTechDiagnostic(ticket);
+      const response = await requestTechDiagnostic(user, ticket);
       setDiagResult({
         data: response.data,
         source: response.source,

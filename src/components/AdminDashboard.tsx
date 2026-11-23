@@ -6,6 +6,7 @@ import {
   ClipboardList,
   Database,
   Download,
+  History,
   Inbox,
   LayoutGrid,
   Loader2,
@@ -16,6 +17,9 @@ import {
   Wrench,
 } from 'lucide-react';
 import {
+  AuditLogEntry,
+  hasPermission,
+  Permission,
   RepairTicket,
   TICKET_STATUSES,
   TicketStatus,
@@ -29,8 +33,9 @@ import { WebhookSettingsPanel } from './WebhookSettingsPanel';
 
 interface AdminDashboardProps {
   user: User;
-  isAdmin: boolean;
+  permissions: Permission[];
   tickets: RepairTicket[];
+  auditLogs: AuditLogEntry[];
   ticketsLoading: boolean;
   aiSelfResolvedCount: number;
   webhookConfigured: boolean;
@@ -45,12 +50,13 @@ interface AdminDashboardProps {
   onSwitchToUser: () => void;
 }
 
-type AdminViewLayout = 'table' | 'board';
+type AdminViewLayout = 'table' | 'board' | 'audit';
 
 export function AdminDashboard({
   user,
-  isAdmin,
+  permissions,
   tickets,
+  auditLogs,
   ticketsLoading,
   aiSelfResolvedCount,
   webhookConfigured,
@@ -129,7 +135,9 @@ export function AdminDashboard({
     });
   }, [tickets, searchQuery, statusFilter, urgencyFilter]);
 
-  if (!isAdmin) {
+  const canManageTickets = hasPermission(permissions, 'ticket:read_all');
+
+  if (!canManageTickets) {
     return (
       <div className="max-w-2xl mx-auto px-4 sm:px-6 py-16">
         <div className="bg-white border border-slate-200 rounded-xl p-8 text-center space-y-4">
@@ -363,7 +371,7 @@ export function AdminDashboard({
           </div>
         </div>
 
-        {/* View Mode Switcher: Table vs Board */}
+        {/* View Mode Switcher: Table vs Board vs Audit Log */}
         <div
           role="group"
           aria-label="รูปแบบการแสดงผล"
@@ -395,11 +403,67 @@ export function AdminDashboard({
             <LayoutGrid className="w-3.5 h-3.5" aria-hidden="true" />
             <span>บอร์ดสถานะ</span>
           </button>
+          <button
+            type="button"
+            onClick={() => setViewLayout('audit')}
+            aria-pressed={viewLayout === 'audit'}
+            className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap tabular-nums ${
+              viewLayout === 'audit'
+                ? 'bg-white text-slate-900 shadow-xs'
+                : 'text-slate-600 hover:text-slate-900'
+            }`}
+          >
+            <History className="w-3.5 h-3.5" aria-hidden="true" />
+            <span>บันทึกตรวจสอบ ({auditLogs.length})</span>
+          </button>
         </div>
       </div>
 
-      {/* Main Content Area: Table or Kanban Board */}
-      {ticketsLoading ? (
+      {/* Main Content Area: Audit Log, Table, or Kanban Board */}
+      {viewLayout === 'audit' ? (
+        <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+          {auditLogs.length === 0 ? (
+            <div className="p-10 text-center text-sm text-slate-500">
+              ยังไม่มีบันทึกประวัติการใช้งาน (Audit Log)
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse">
+                <thead>
+                  <tr className="border-b border-slate-200 bg-slate-50/80 text-xs font-semibold text-slate-600">
+                    <th className="py-3 px-4 whitespace-nowrap">วันเวลา</th>
+                    <th className="py-3 px-4 whitespace-nowrap">กิจกรรม</th>
+                    <th className="py-3 px-4 whitespace-nowrap">เป้าหมาย</th>
+                    <th className="py-3 px-4 whitespace-nowrap">ผู้ดำเนินการ</th>
+                    <th className="py-3 px-4">รายละเอียด</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-200 text-xs">
+                  {auditLogs.map((log) => (
+                    <tr key={log.id} className="hover:bg-slate-50/70">
+                      <td className="py-3 px-4 whitespace-nowrap text-slate-600 tabular-nums">
+                        {formatThaiDateTime(log.createdAt)}
+                      </td>
+                      <td className="py-3 px-4 whitespace-nowrap font-mono text-slate-800">
+                        {log.action}
+                      </td>
+                      <td className="py-3 px-4 whitespace-nowrap font-mono text-slate-700">
+                        {log.targetId}
+                      </td>
+                      <td className="py-3 px-4 whitespace-nowrap text-slate-700">
+                        {log.actorEmail}
+                      </td>
+                      <td className="py-3 px-4 text-slate-700">
+                        {log.summary}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      ) : ticketsLoading ? (
         <div className="bg-white border border-slate-200 rounded-xl p-10 text-center space-y-3">
           <Loader2 className="w-6 h-6 text-blue-700 animate-spin mx-auto" />
           <p className="text-sm text-slate-600">กำลังเชื่อมต่อข้อมูลงานซ่อมจาก Firestore...</p>
@@ -645,6 +709,7 @@ export function AdminDashboard({
 
       {/* Slide-over Detail & Status Editor Drawer */}
       <TicketDetailDrawer
+        user={user}
         ticket={selectedTicket}
         onClose={() => setSelectedTicketId(null)}
         onUpdateTicket={(id, updates) => {

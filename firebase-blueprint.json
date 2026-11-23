@@ -117,6 +117,23 @@
         "updatedAt"
       ]
     },
+    "TicketCounter": {
+      "title": "TicketCounter",
+      "description": "Atomic sequential counter for conflict-free Ticket ID allocation.",
+      "type": "object",
+      "properties": {
+        "lastNumber": {
+          "type": "integer",
+          "description": "Last allocated sequential ticket number"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the last allocation"
+        }
+      },
+      "required": ["lastNumber", "updatedAt"]
+    },
     "AiResolution": {
       "title": "AiResolution",
       "description": "Record of an issue resolved by an employee using the AI Troubleshooting Assistant without opening a ticket.",
@@ -173,12 +190,66 @@
         }
       },
       "required": ["email", "addedByUid", "createdAt"]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Immutable append-only security and workflow audit event.",
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "description": "Audit action identifier",
+          "enum": [
+            "ticket.created",
+            "ticket.updated",
+            "ticket.deleted",
+            "ai.self_resolved",
+            "admin.demo_seeded",
+            "webhook.config_updated"
+          ]
+        },
+        "targetId": {
+          "type": "string",
+          "description": "Target ticket or resource ID",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "actorUid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the actor",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "actorEmail": {
+          "type": "string",
+          "format": "email",
+          "description": "Verified email of the actor",
+          "minLength": 3,
+          "maxLength": 160
+        },
+        "summary": {
+          "type": "string",
+          "description": "Human-readable audit summary in Thai",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when audit event occurred"
+        }
+      },
+      "required": ["action", "targetId", "actorUid", "actorEmail", "summary", "createdAt"]
     }
   },
   "firestore": {
     "/tickets/{ticketId}": {
       "schema": { "$ref": "#/entities/Ticket" },
       "description": "Collection of IT repair tickets."
+    },
+    "/counters/{counterId}": {
+      "schema": { "$ref": "#/entities/TicketCounter" },
+      "description": "Atomic sequential counters for ticket numbering."
     },
     "/aiResolutions/{resolutionId}": {
       "schema": { "$ref": "#/entities/AiResolution" },
@@ -187,6 +258,10 @@
     "/admins/{uid}": {
       "schema": { "$ref": "#/entities/AdminUser" },
       "description": "IT administrator role lookup collection."
+    },
+    "/auditLogs/{logId}": {
+      "schema": { "$ref": "#/entities/AuditLog" },
+      "description": "Append-only audit trail for governance and accountability."
     }
   }
 }

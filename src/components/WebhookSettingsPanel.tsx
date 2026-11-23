@@ -17,6 +17,7 @@ import {
   WebhookStatusResponse,
   WebhookType,
 } from '../services/webhookService';
+import { logWebhookConfigUpdated } from '../services/ticketService';
 
 interface WebhookSettingsPanelProps {
   isOpen: boolean;
@@ -69,6 +70,7 @@ export function WebhookSettingsPanel({
       setStatus(updated);
       setUrlInput('');
       onStatusChanged?.(updated.configured);
+      void logWebhookConfigUpdated(user, `อัปเดตการตั้งค่า Webhook (${typeInput})`);
       setFeedback({
         type: 'success',
         message: 'บันทึก Webhook URL เรียบร้อยแล้ว ระบบจะยิงแจ้งเตือนทันทีเมื่อมีใบแจ้งซ่อมใหม่',
@@ -90,6 +92,7 @@ export function WebhookSettingsPanel({
       const updated = await clearWebhookConfig(user);
       setStatus(updated);
       onStatusChanged?.(updated.configured);
+      void logWebhookConfigUpdated(user, 'ล้างการตั้งค่า Runtime Webhook ชั่วคราว');
       setFeedback({
         type: 'success',
         message: 'ยกเลิกการเชื่อมต่อ Webhook ชั่วคราวแล้ว',
@@ -227,7 +230,7 @@ export function WebhookSettingsPanel({
               className="w-full rounded-lg border border-slate-300 px-3.5 py-2 text-sm font-mono text-slate-900 placeholder:font-sans placeholder:text-slate-400 focus:border-blue-600 focus:outline-none focus:ring-2 focus:ring-blue-600/15"
             />
             <p className="mt-1.5 text-xs text-slate-500">
-              URL จะถูกเก็บไว้ฝั่งเซิร์ฟเวอร์เท่านั้น ไม่เปิดเผยไปยังฝั่งผู้ใช้งานทั่วไป (หรือกำหนดผ่านตัวแปร WEBHOOK_URL ใน Settings &gt; Secrets)
+              URL จะถูกเก็บไว้ฝั่งเซิร์ฟเวอร์เท่านั้น ไม่เปิดเผยไปยังฝั่งผู้ใช้งาน (การตั้งค่าในหน้านี้เป็น Runtime Memory สำหรับทดสอบ หากใช้งานหลาย Instance/Production แนะนำให้กำหนดตัวแปร WEBHOOK_URL ใน Secret Manager / Environment)
             </p>
           </div>
 
