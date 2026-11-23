@@ -1,0 +1,184 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isBootstrappedAdmin() {
+      return isSignedIn() && request.auth.token.email == 'niphan1000@gmail.com';
+    }
+
+    function isAdmin() {
+      return isBootstrappedAdmin() || (
+        isSignedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    function isValidAiTroubleshooting(ai) {
+      return ai is map
+        && ai.keys().hasAll(['summary', 'steps', 'warningNote', 'source', 'triedAt'])
+        && ai.keys().hasOnly(['summary', 'steps', 'warningNote', 'source', 'triedAt'])
+        && ai.summary is string && ai.summary.size() <= 1000
+        && ai.steps is list && ai.steps.size() >= 1 && ai.steps.size() <= 10
+        && ai.steps[0] is string && ai.steps[0].size() <= 600
+        && ai.warningNote is string && ai.warningNote.size() <= 600
+        && ai.source in ['gemini', 'fallback']
+        && ai.triedAt is string && ai.triedAt.size() <= 64;
+    }
+
+    function isValidTicket(data) {
+      return data.keys().hasAll([
+          'id',
+          'requesterName',
+          'department',
+          'contactInfo',
+          'category',
+          'urgency',
+          'description',
+          'assetTag',
+          'status',
+          'resolutionNote',
+          'createdByUid',
+          'createdByEmail',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id',
+          'requesterName',
+          'department',
+          'contactInfo',
+          'category',
+          'urgency',
+          'description',
+          'assetTag',
+          'status',
+          'resolutionNote',
+          'createdByUid',
+          'createdByEmail',
+          'createdAt',
+          'updatedAt',
+          'completedAt',
+          'aiTroubleshooting'
+        ])
+        && data.id is string && data.id.size() >= 3 && data.id.size() <= 32 && data.id.matches('^IT-[0-9]{4}-[0-9]{3,6}$')
+        && data.requesterName is string && data.requesterName.size() >= 1 && data.requesterName.size() <= 100
+        && data.department in ['บัญชี', 'การตลาด', 'บุคคล', 'ขาย', 'ไอที', 'อื่นๆ']
+        && data.contactInfo is string && data.contactInfo.size() >= 1 && data.contactInfo.size() <= 120
+        && data.category in [
+          'คอมพิวเตอร์เปิดไม่ติด/จอดำ',
+          'ลง Windows/โปรแกรมใหม่',
+          'อินเทอร์เน็ต/Wi-Fi มีปัญหา',
+          'ปริ้นเตอร์/สแกนเนอร์',
+          'อุปกรณ์ต่อพ่วง เมาส์/คีย์บอร์ด',
+          'อื่นๆ'
+        ]
+        && data.urgency in ['ปกติ', 'ด่วน', 'ด่วนมาก - ทำงานต่อไม่ได้']
+        && data.description is string && data.description.size() >= 1 && data.description.size() <= 2000
+        && data.assetTag is string && data.assetTag.size() <= 64
+        && data.status in ['รอดำเนินการ', 'กำลังซ่อม', 'รออะไหล่', 'เสร็จสิ้น']
+        && data.resolutionNote is string && data.resolutionNote.size() <= 2000
+        && data.createdByUid is string && data.createdByUid.size() >= 1 && data.createdByUid.size() <= 128
+        && data.createdByEmail is string && data.createdByEmail.size() >= 3 && data.createdByEmail.size() <= 160
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp
+        && (!('completedAt' in data) || data.completedAt == null || data.completedAt is timestamp)
+        && (!('aiTroubleshooting' in data) || data.aiTroubleshooting == null || isValidAiTroubleshooting(data.aiTroubleshooting));
+    }
+
+    function isValidAiResolution(data) {
+      return data.keys().hasAll(['category', 'createdByUid', 'createdAt'])
+        && data.keys().hasOnly(['category', 'createdByUid', 'createdAt'])
+        && data.category in [
+          'คอมพิวเตอร์เปิดไม่ติด/จอดำ',
+          'ลง Windows/โปรแกรมใหม่',
+          'อินเทอร์เน็ต/Wi-Fi มีปัญหา',
+          'ปริ้นเตอร์/สแกนเนอร์',
+          'อุปกรณ์ต่อพ่วง เมาส์/คีย์บอร์ด',
+          'อื่นๆ'
+        ]
+        && data.createdByUid is string && data.createdByUid.size() >= 1 && data.createdByUid.size() <= 128
+        && data.createdAt is timestamp;
+    }
+
+    function isValidAdminUser(data) {
+      return data.keys().hasAll(['email', 'addedByUid', 'createdAt'])
+        && data.keys().hasOnly(['email', 'addedByUid', 'createdAt'])
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 160
+        && data.addedByUid is string && data.addedByUid.size() >= 1 && data.addedByUid.size() <= 128
+        && data.createdAt is timestamp;
+    }
+
+    match /tickets/{ticketId} {
+      allow get: if isSignedIn() && isValidId(ticketId) && (existing().createdByUid == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (resource.data.createdByUid == request.auth.uid || isBootstrappedAdmin());
+
+      allow create: if isSignedIn()
+        && isValidId(ticketId)
+        && isValidTicket(incoming())
+        && incoming().id == ticketId
+        && incoming().createdByUid == request.auth.uid
+        && incoming().createdByEmail == request.auth.token.email
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && (incoming().status == 'รอดำเนินการ' || isAdmin());
+
+      allow update: if isSignedIn()
+        && isValidId(ticketId)
+        && isValidTicket(incoming())
+        && isAdmin()
+        && incoming().id == existing().id
+        && incoming().createdByUid == existing().createdByUid
+        && incoming().createdByEmail == existing().createdByEmail
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'resolutionNote', 'completedAt', 'updatedAt']);
+
+      allow delete: if isSignedIn() && isValidId(ticketId) && isAdmin();
+    }
+
+    match /aiResolutions/{resolutionId} {
+      allow get: if isSignedIn() && isValidId(resolutionId) && (existing().createdByUid == request.auth.uid || isAdmin());
+      allow list: if isSignedIn() && (resource.data.createdByUid == request.auth.uid || isBootstrappedAdmin());
+
+      allow create: if isSignedIn()
+        && isValidId(resolutionId)
+        && isValidAiResolution(incoming())
+        && incoming().createdByUid == request.auth.uid
+        && incoming().createdAt == request.time;
+
+      allow update, delete: if false;
+    }
+
+    match /admins/{uid} {
+      allow get: if isSignedIn() && isValidId(uid) && (request.auth.uid == uid || isAdmin());
+      allow list: if isBootstrappedAdmin();
+      allow create: if isSignedIn()
+        && isValidId(uid)
+        && isAdmin()
+        && isValidAdminUser(incoming())
+        && incoming().addedByUid == request.auth.uid
+        && incoming().createdAt == request.time;
+      allow update, delete: if isSignedIn() && isValidId(uid) && isBootstrappedAdmin();
+    }
+  }
+}

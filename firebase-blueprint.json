@@ -1,0 +1,192 @@
+{
+  "entities": {
+    "Ticket": {
+      "title": "RepairTicket",
+      "description": "IT helpdesk repair ticket submitted by an employee and managed by IT administrators.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Human-readable ticket ID such as IT-2026-001",
+          "minLength": 3,
+          "maxLength": 32,
+          "pattern": "^IT-[0-9]{4}-[0-9]{3,6}$"
+        },
+        "requesterName": {
+          "type": "string",
+          "description": "Full name of the employee submitting the repair request",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "department": {
+          "type": "string",
+          "description": "Department of the requester",
+          "enum": ["บัญชี", "การตลาด", "บุคคล", "ขาย", "ไอที", "อื่นๆ"]
+        },
+        "contactInfo": {
+          "type": "string",
+          "description": "Internal extension number or LINE ID",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "category": {
+          "type": "string",
+          "description": "Problem category",
+          "enum": [
+            "คอมพิวเตอร์เปิดไม่ติด/จอดำ",
+            "ลง Windows/โปรแกรมใหม่",
+            "อินเทอร์เน็ต/Wi-Fi มีปัญหา",
+            "ปริ้นเตอร์/สแกนเนอร์",
+            "อุปกรณ์ต่อพ่วง เมาส์/คีย์บอร์ด",
+            "อื่นๆ"
+          ]
+        },
+        "urgency": {
+          "type": "string",
+          "description": "Urgency level",
+          "enum": ["ปกติ", "ด่วน", "ด่วนมาก - ทำงานต่อไม่ได้"]
+        },
+        "description": {
+          "type": "string",
+          "description": "Detailed description of the IT issue",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "assetTag": {
+          "type": "string",
+          "description": "Optional asset tag or equipment code",
+          "maxLength": 64
+        },
+        "status": {
+          "type": "string",
+          "description": "Current repair status",
+          "enum": ["รอดำเนินการ", "กำลังซ่อม", "รออะไหล่", "เสร็จสิ้น"]
+        },
+        "resolutionNote": {
+          "type": "string",
+          "description": "Technician notes and resolution summary",
+          "maxLength": 2000
+        },
+        "createdByUid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the user who created the ticket",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "createdByEmail": {
+          "type": "string",
+          "format": "email",
+          "description": "Verified email of the user who created the ticket",
+          "minLength": 3,
+          "maxLength": 160
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when ticket was created"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when ticket was last updated"
+        },
+        "completedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when ticket reached เสร็จสิ้น"
+        },
+        "aiTroubleshooting": {
+          "type": "object",
+          "description": "Optional AI self-help steps tried by the user before submitting the ticket"
+        }
+      },
+      "required": [
+        "id",
+        "requesterName",
+        "department",
+        "contactInfo",
+        "category",
+        "urgency",
+        "description",
+        "assetTag",
+        "status",
+        "resolutionNote",
+        "createdByUid",
+        "createdByEmail",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "AiResolution": {
+      "title": "AiResolution",
+      "description": "Record of an issue resolved by an employee using the AI Troubleshooting Assistant without opening a ticket.",
+      "type": "object",
+      "properties": {
+        "category": {
+          "type": "string",
+          "description": "Problem category resolved by AI",
+          "enum": [
+            "คอมพิวเตอร์เปิดไม่ติด/จอดำ",
+            "ลง Windows/โปรแกรมใหม่",
+            "อินเทอร์เน็ต/Wi-Fi มีปัญหา",
+            "ปริ้นเตอร์/สแกนเนอร์",
+            "อุปกรณ์ต่อพ่วง เมาส์/คีย์บอร์ด",
+            "อื่นๆ"
+          ]
+        },
+        "createdByUid": {
+          "type": "string",
+          "description": "UID of the user who resolved the issue",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the AI self-resolution was logged"
+        }
+      },
+      "required": ["category", "createdByUid", "createdAt"]
+    },
+    "AdminUser": {
+      "title": "AdminUser",
+      "description": "IT administrator grant document keyed by Firebase Auth UID.",
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Admin email address",
+          "minLength": 3,
+          "maxLength": 160
+        },
+        "addedByUid": {
+          "type": "string",
+          "description": "UID of the admin who granted access",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when admin access was granted"
+        }
+      },
+      "required": ["email", "addedByUid", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/tickets/{ticketId}": {
+      "schema": { "$ref": "#/entities/Ticket" },
+      "description": "Collection of IT repair tickets."
+    },
+    "/aiResolutions/{resolutionId}": {
+      "schema": { "$ref": "#/entities/AiResolution" },
+      "description": "Logs of issues solved via AI self-service."
+    },
+    "/admins/{uid}": {
+      "schema": { "$ref": "#/entities/AdminUser" },
+      "description": "IT administrator role lookup collection."
+    }
+  }
+}

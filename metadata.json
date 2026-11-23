@@ -1,0 +1,6 @@
+{
+  "name": "ศูนย์บริการแจ้งซ่อมไอที (IT Helpdesk)",
+  "description": "ระบบแจ้งซ่อมคอมพิวเตอร์และอุปกรณ์ไอที สำหรับผู้ใช้งานและเจ้าหน้าที่ไอที พร้อมระบบติดตามสถานะและส่งออกรายงาน CSV",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
