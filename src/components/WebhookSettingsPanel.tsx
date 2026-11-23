@@ -17,7 +17,6 @@ import {
   WebhookStatusResponse,
   WebhookType,
 } from '../services/webhookService';
-import { logWebhookConfigUpdated } from '../services/ticketService';
 
 interface WebhookSettingsPanelProps {
   isOpen: boolean;
@@ -70,7 +69,6 @@ export function WebhookSettingsPanel({
       setStatus(updated);
       setUrlInput('');
       onStatusChanged?.(updated.configured);
-      void logWebhookConfigUpdated(user, `อัปเดตการตั้งค่า Webhook (${typeInput})`);
       setFeedback({
         type: 'success',
         message: 'บันทึก Webhook URL เรียบร้อยแล้ว ระบบจะยิงแจ้งเตือนทันทีเมื่อมีใบแจ้งซ่อมใหม่',
@@ -92,7 +90,6 @@ export function WebhookSettingsPanel({
       const updated = await clearWebhookConfig(user);
       setStatus(updated);
       onStatusChanged?.(updated.configured);
-      void logWebhookConfigUpdated(user, 'ล้างการตั้งค่า Runtime Webhook ชั่วคราว');
       setFeedback({
         type: 'success',
         message: 'ยกเลิกการเชื่อมต่อ Webhook ชั่วคราวแล้ว',

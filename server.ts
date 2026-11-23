@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { GoogleGenAI, Type } from '@google/genai';
 import {
   parseFirestoreTicketDocument,
+  postJsonWithPinnedIp,
   SlidingWindowRateLimiter,
   validateWebhookUrlAndResolve,
 } from './server/security.ts';
@@ -232,29 +233,21 @@ async function dispatchWebhook(
   isTest = false
 ): Promise<void> {
   const check = await validateWebhookUrlAndResolve(url, ALLOWED_WEBHOOK_HOSTS);
-  if (!check.valid || !check.url) {
+  if (!check.valid || !check.url || !check.resolvedIps || check.resolvedIps.length === 0) {
     throw new Error(check.error || 'Webhook URL ไม่ผ่านการตรวจสอบความปลอดภัย');
   }
 
   const targetKind = detectWebhookType(check.url.toString(), configuredType);
   const body = buildWebhookBody(targetKind, ticket, isTest);
+  const pinnedIp = check.resolvedIps[0];
 
-  const response = await fetch(check.url.toString(), {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'User-Agent': 'it-helpdesk-webhook/1.0',
-    },
-    body: JSON.stringify(body),
-    redirect: 'manual',
-    signal: AbortSignal.timeout(8000),
-  });
+  const response = await postJsonWithPinnedIp(check.url, pinnedIp, body, 8000);
 
   if (response.status >= 300 && response.status < 400) {
     throw new Error('ปลายทาง Webhook พยายาม Redirect ซึ่งถูกปฏิเสธเพื่อความปลอดภัย');
   }
 
-  if (!response.ok) {
+  if (response.status < 200 || response.status >= 300) {
     throw new Error(`ปลายทาง Webhook ตอบกลับสถานะ HTTP ${response.status}`);
   }
 }
@@ -351,6 +344,58 @@ async function fetchFirestoreTicketAsUser(
 
   const json = await res.json();
   return { status: 200, ticket: parseFirestoreTicketDocument(json) };
+}
+
+async function writeBackendAuditLog(
+  user: VerifiedUser,
+  entry: {
+    action: 'webhook.config_updated';
+    targetId: string;
+    summary: string;
+  }
+): Promise<void> {
+  if (!FIREBASE_PROJECT_ID) return;
+  const logId = `aud-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const docName = `projects/${FIREBASE_PROJECT_ID}/databases/${FIRESTORE_DATABASE_ID}/documents/auditLogs/${logId}`;
+  const commitUrl = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
+    FIREBASE_PROJECT_ID
+  )}/databases/${encodeURIComponent(FIRESTORE_DATABASE_ID)}/documents:commit`;
+
+  try {
+    await fetch(commitUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${user.idToken}`,
+      },
+      body: JSON.stringify({
+        writes: [
+          {
+            update: {
+              name: docName,
+              fields: {
+                action: { stringValue: entry.action },
+                targetId: { stringValue: entry.targetId.slice(0, 128) },
+                actorUid: { stringValue: user.uid },
+                actorEmail: { stringValue: user.email },
+                summary: { stringValue: entry.summary.slice(0, 500) },
+              },
+            },
+            currentDocument: { exists: false },
+            updateTransforms: [
+              {
+                fieldPath: 'createdAt',
+                setToServerValue: 'REQUEST_TIME',
+              },
+            ],
+          },
+        ],
+      }),
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch {
+    // Non-blocking audit persistence
+  }
 }
 
 function enforceAiRateLimit(user: VerifiedUser, req: Request, res: Response): boolean {
@@ -806,6 +851,11 @@ async function startServer() {
 
     if (!url) {
       runtimeWebhookConfig = null;
+      await writeBackendAuditLog(user, {
+        action: 'webhook.config_updated',
+        targetId: 'webhook',
+        summary: 'ล้างการตั้งค่า Runtime Webhook ชั่วคราวผ่าน Trusted Backend',
+      });
       const effective = getEffectiveWebhook();
       res.json({
         configured: Boolean(effective.url),
@@ -823,6 +873,11 @@ async function startServer() {
     }
 
     runtimeWebhookConfig = { url: check.url.toString(), type };
+    await writeBackendAuditLog(user, {
+      action: 'webhook.config_updated',
+      targetId: 'webhook',
+      summary: `อัปเดตการตั้งค่า Runtime Webhook (${type}) ผ่าน Trusted Backend`,
+    });
     const effective = getEffectiveWebhook();
     res.json({
       configured: true,

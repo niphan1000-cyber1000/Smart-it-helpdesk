@@ -1,4 +1,5 @@
 import dns from 'node:dns/promises';
+import https from 'node:https';
 import net from 'node:net';
 
 export interface RateLimitResult {
@@ -46,46 +47,135 @@ export class SlidingWindowRateLimiter {
   }
 }
 
-export function isPrivateOrBlockedIp(rawIp: string): boolean {
-  const ip = rawIp.trim().toLowerCase();
-  if (!ip) return true;
+function isBlockedIPv4Octets(a: number, b: number): boolean {
+  if (a === 0 || a === 10 || a === 127) return true;
+  if (a === 169 && b === 254) return true; // link-local / cloud metadata
+  if (a === 172 && b >= 16 && b <= 31) return true; // RFC1918
+  if (a === 192 && b === 168) return true; // RFC1918
+  if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
+  if (a === 192 && b === 0) return true; // IETF protocol assignments
+  if (a === 198 && (b === 18 || b === 19)) return true; // benchmarking
+  if (a >= 224) return true; // multicast / reserved
+  return false;
+}
 
-  // Handle IPv4-mapped IPv6 addresses like ::ffff:127.0.0.1
-  if (ip.startsWith('::ffff:')) {
-    const v4Part = ip.slice(7);
-    if (net.isIPv4(v4Part)) {
-      return isPrivateOrBlockedIp(v4Part);
+export function parseIPv6Hextets(rawIp: string): number[] | null {
+  let ip = rawIp.trim().toLowerCase();
+  const zoneIdx = ip.indexOf('%');
+  if (zoneIdx !== -1) {
+    ip = ip.slice(0, zoneIdx);
+  }
+  if (!net.isIPv6(ip)) return null;
+
+  // Convert trailing dotted-quad IPv4 (if any) into two 16-bit hextets
+  const lastColon = ip.lastIndexOf(':');
+  if (lastColon !== -1) {
+    const tail = ip.slice(lastColon + 1);
+    if (net.isIPv4(tail)) {
+      const octets = tail.split('.').map((n) => parseInt(n, 10));
+      const hi = ((octets[0] << 8) | octets[1]).toString(16);
+      const lo = ((octets[2] << 8) | octets[3]).toString(16);
+      ip = `${ip.slice(0, lastColon + 1)}${hi}:${lo}`;
     }
   }
+
+  const parts = ip.split('::');
+  if (parts.length > 2) return null;
+
+  const left = parts[0] ? parts[0].split(':') : [];
+  const right = parts.length === 2 && parts[1] ? parts[1].split(':') : [];
+  const missing = 8 - (left.length + right.length);
+  if (parts.length === 1 && missing !== 0) return null;
+  if (parts.length === 2 && missing < 0) return null;
+
+  const fullStrings = [
+    ...left,
+    ...Array.from({ length: Math.max(0, missing) }, () => '0'),
+    ...right,
+  ];
+  if (fullStrings.length !== 8) return null;
+
+  const hextets: number[] = [];
+  for (const hex of fullStrings) {
+    if (!/^[0-9a-f]{1,4}$/.test(hex)) return null;
+    hextets.push(parseInt(hex, 16));
+  }
+  return hextets;
+}
+
+function isBlockedHextetIPv4(hi: number, lo: number): boolean {
+  const a = (hi >> 8) & 0xff;
+  const b = hi & 0xff;
+  const c = (lo >> 8) & 0xff;
+  const d = lo & 0xff;
+  if (
+    Number.isNaN(a) ||
+    Number.isNaN(b) ||
+    Number.isNaN(c) ||
+    Number.isNaN(d)
+  ) {
+    return true;
+  }
+  return isBlockedIPv4Octets(a, b);
+}
+
+export function isPrivateOrBlockedIp(rawIp: string): boolean {
+  const ip = rawIp.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (!ip) return true;
 
   if (net.isIPv4(ip)) {
     const parts = ip.split('.').map((n) => parseInt(n, 10));
     if (parts.length !== 4 || parts.some((n) => Number.isNaN(n))) return true;
-    const [a, b] = parts;
-    if (a === 0 || a === 10 || a === 127) return true;
-    if (a === 169 && b === 254) return true; // link-local / cloud metadata
-    if (a === 172 && b >= 16 && b <= 31) return true; // RFC1918
-    if (a === 192 && b === 168) return true; // RFC1918
-    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
-    if (a >= 224) return true; // multicast / reserved
-    return false;
+    return isBlockedIPv4Octets(parts[0], parts[1]);
   }
 
-  if (net.isIPv6(ip)) {
-    if (
-      ip === '::' ||
-      ip === '::1' ||
-      ip.startsWith('fc') ||
-      ip.startsWith('fd') ||
-      ip.startsWith('fe80') ||
-      ip.startsWith('ff')
-    ) {
-      return true;
+  const g = parseIPv6Hextets(ip);
+  if (!g) return true;
+
+  // Unspecified ::
+  if (g.every((v) => v === 0)) return true;
+
+  // Loopback ::1
+  if (g.slice(0, 7).every((v) => v === 0) && g[7] === 1) return true;
+
+  // IPv4-mapped IPv6 ::ffff:0:0/96 (decimal or hex form, e.g. ::ffff:7f00:1)
+  if (g.slice(0, 5).every((v) => v === 0) && g[5] === 0xffff) {
+    return isBlockedHextetIPv4(g[6], g[7]);
+  }
+
+  // Deprecated IPv4-compatible IPv6 ::/96 (e.g. ::127.0.0.1 or ::7f00:1)
+  if (g.slice(0, 6).every((v) => v === 0)) {
+    return isBlockedHextetIPv4(g[6], g[7]);
+  }
+
+  // NAT64 well-known prefix 64:ff9b::/96 & local-use 64:ff9b:1::/48
+  if (g[0] === 0x0064 && g[1] === 0xff9b) {
+    if (g[2] === 0x0001) return true;
+    if (g.slice(2, 6).every((v) => v === 0)) {
+      return isBlockedHextetIPv4(g[6], g[7]);
     }
-    return false;
   }
 
-  return true;
+  // 6to4 2002::/16 embedding IPv4 in groups 1 and 2
+  if (g[0] === 0x2002 && isBlockedHextetIPv4(g[1], g[2])) {
+    return true;
+  }
+
+  // Teredo 2001::/32 & Documentation 2001:db8::/32
+  if (g[0] === 0x2001 && (g[1] === 0x0000 || g[1] === 0x0db8)) {
+    return true;
+  }
+
+  // ULA fc00::/7
+  if ((g[0] & 0xfe00) === 0xfc00) return true;
+
+  // Link-local fe80::/10
+  if ((g[0] & 0xffc0) === 0xfe80) return true;
+
+  // Multicast ff00::/8
+  if ((g[0] & 0xff00) === 0xff00) return true;
+
+  return false;
 }
 
 export interface WebhookUrlCheckResult {
@@ -135,7 +225,7 @@ export function validateWebhookUrlStructure(
     };
   }
 
-  const host = parsed.hostname.toLowerCase();
+  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
   if (
     !host ||
     host === 'localhost' ||
@@ -157,7 +247,9 @@ export function validateWebhookUrlStructure(
   }
 
   if (allowedHosts.length > 0) {
-    const normalizedAllowed = allowedHosts.map((h) => h.trim().toLowerCase()).filter(Boolean);
+    const normalizedAllowed = allowedHosts
+      .map((h) => h.trim().toLowerCase())
+      .filter(Boolean);
     const matches = normalizedAllowed.some(
       (allowed) => host === allowed || host.endsWith(`.${allowed}`)
     );
@@ -181,7 +273,7 @@ export async function validateWebhookUrlAndResolve(
     return structural;
   }
 
-  const host = structural.url.hostname.toLowerCase();
+  const host = structural.url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
   if (net.isIP(host) !== 0) {
     return {
       valid: true,
@@ -215,6 +307,73 @@ export async function validateWebhookUrlAndResolve(
       error: 'ไม่สามารถตรวจสอบ DNS ของ Webhook URL ได้',
     };
   }
+}
+
+export function createPinnedLookup(pinnedIp: string): net.LookupFunction {
+  const family: 4 | 6 = net.isIPv6(pinnedIp) ? 6 : 4;
+  return (_hostname, options, callback) => {
+    if (options && typeof options === 'object' && options.all) {
+      (
+        callback as unknown as (
+          err: null,
+          addresses: Array<{ address: string; family: number }>
+        ) => void
+      )(null, [{ address: pinnedIp, family }]);
+      return;
+    }
+    callback(null, pinnedIp, family);
+  };
+}
+
+export async function postJsonWithPinnedIp(
+  targetUrl: URL,
+  pinnedIp: string,
+  payload: Record<string, unknown>,
+  timeoutMs = 8000
+): Promise<{ status: number }> {
+  if (isPrivateOrBlockedIp(pinnedIp)) {
+    throw new Error('ปลายทาง IP ของ Webhook ถูกบล็อกเพื่อความปลอดภัย');
+  }
+
+  const bodyString = JSON.stringify(payload);
+  const hostHeader = targetUrl.host;
+  const servername = targetUrl.hostname.replace(/^\[|\]$/g, '');
+  const port = targetUrl.port ? Number(targetUrl.port) : 443;
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname: servername,
+        port,
+        path: `${targetUrl.pathname}${targetUrl.search}`,
+        method: 'POST',
+        servername,
+        lookup: createPinnedLookup(pinnedIp),
+        headers: {
+          Host: hostHeader,
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(bodyString),
+          'User-Agent': 'it-helpdesk-webhook/1.0',
+        },
+        timeout: timeoutMs,
+      },
+      (res) => {
+        res.resume();
+        resolve({ status: res.statusCode ?? 0 });
+      }
+    );
+
+    req.on('timeout', () => {
+      req.destroy(new Error('การเชื่อมต่อ Webhook เกินเวลาที่กำหนด'));
+    });
+
+    req.on('error', (err) => {
+      reject(err);
+    });
+
+    req.write(bodyString);
+    req.end();
+  });
 }
 
 export interface ParsedFirestoreTicket {

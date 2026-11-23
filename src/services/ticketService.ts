@@ -1,7 +1,6 @@
 import { User } from 'firebase/auth';
 import {
   collection,
-  deleteDoc,
   doc,
   getDoc,
   limit,
@@ -9,10 +8,8 @@ import {
   query,
   runTransaction,
   serverTimestamp,
-  setDoc,
   Timestamp,
   Unsubscribe,
-  updateDoc,
   where,
   writeBatch,
 } from 'firebase/firestore';
@@ -317,9 +314,9 @@ export async function updateTicketInFirestore(
   };
 
   try {
-    await updateDoc(doc(db, 'tickets', ticketId), payload);
-    const auditId = makeAuditId();
-    await setDoc(doc(db, 'auditLogs', auditId), {
+    const batch = writeBatch(db);
+    batch.update(doc(db, 'tickets', ticketId), payload);
+    batch.set(doc(db, 'auditLogs', makeAuditId()), {
       action: 'ticket.updated',
       targetId: ticketId,
       actorUid: actor.uid,
@@ -327,6 +324,7 @@ export async function updateTicketInFirestore(
       summary: `อัปเดตสถานะ ${ticketId} เป็น "${updates.status}"`,
       createdAt: serverTimestamp(),
     });
+    await batch.commit();
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, path);
   }
@@ -338,9 +336,9 @@ export async function deleteTicketInFirestore(
 ): Promise<void> {
   const path = `tickets/${ticketId}`;
   try {
-    await deleteDoc(doc(db, 'tickets', ticketId));
-    const auditId = makeAuditId();
-    await setDoc(doc(db, 'auditLogs', auditId), {
+    const batch = writeBatch(db);
+    batch.delete(doc(db, 'tickets', ticketId));
+    batch.set(doc(db, 'auditLogs', makeAuditId()), {
       action: 'ticket.deleted',
       targetId: ticketId,
       actorUid: actor.uid,
@@ -348,6 +346,7 @@ export async function deleteTicketInFirestore(
       summary: `ลบใบแจ้งซ่อม ${ticketId}`,
       createdAt: serverTimestamp(),
     });
+    await batch.commit();
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, path);
   }
@@ -360,13 +359,13 @@ export async function logAiSelfResolutionInFirestore(
   const resolutionId = `res-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const path = `aiResolutions/${resolutionId}`;
   try {
-    await setDoc(doc(db, 'aiResolutions', resolutionId), {
+    const batch = writeBatch(db);
+    batch.set(doc(db, 'aiResolutions', resolutionId), {
       category,
       createdByUid: user.uid,
       createdAt: serverTimestamp(),
     });
-    const auditId = makeAuditId();
-    await setDoc(doc(db, 'auditLogs', auditId), {
+    batch.set(doc(db, 'auditLogs', makeAuditId()), {
       action: 'ai.self_resolved',
       targetId: resolutionId,
       actorUid: user.uid,
@@ -374,27 +373,9 @@ export async function logAiSelfResolutionInFirestore(
       summary: `ผู้ใช้แก้ไขปัญหา "${category}" สำเร็จด้วย AI ผู้ช่วยซ่อมเบื้องต้น`,
       createdAt: serverTimestamp(),
     });
+    await batch.commit();
   } catch (error) {
     handleFirestoreError(error, OperationType.CREATE, path);
-  }
-}
-
-export async function logWebhookConfigUpdated(
-  actor: User,
-  summaryText: string
-): Promise<void> {
-  try {
-    const auditId = makeAuditId();
-    await setDoc(doc(db, 'auditLogs', auditId), {
-      action: 'webhook.config_updated',
-      targetId: 'webhook',
-      actorUid: actor.uid,
-      actorEmail: actor.email || '',
-      summary: summaryText.slice(0, 500),
-      createdAt: serverTimestamp(),
-    });
-  } catch {
-    // Non-blocking audit log
   }
 }
 

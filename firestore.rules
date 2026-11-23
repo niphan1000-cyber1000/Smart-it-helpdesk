@@ -241,7 +241,40 @@ service cloud.firestore {
         && isValidAuditLog(incoming())
         && incoming().actorUid == request.auth.uid
         && incoming().actorEmail == request.auth.token.email
-        && incoming().createdAt == request.time;
+        && incoming().createdAt == request.time
+        && (
+          (
+            incoming().action in ['admin.demo_seeded', 'webhook.config_updated']
+            && isAdmin()
+          )
+          || (
+            incoming().action == 'ticket.updated'
+            && isAdmin()
+            && isValidId(incoming().targetId)
+            && existsAfter(/databases/$(database)/documents/tickets/$(incoming().targetId))
+          )
+          || (
+            incoming().action == 'ticket.deleted'
+            && isAdmin()
+            && isValidId(incoming().targetId)
+            && exists(/databases/$(database)/documents/tickets/$(incoming().targetId))
+            && !existsAfter(/databases/$(database)/documents/tickets/$(incoming().targetId))
+          )
+          || (
+            incoming().action == 'ticket.created'
+            && isValidId(incoming().targetId)
+            && !exists(/databases/$(database)/documents/tickets/$(incoming().targetId))
+            && existsAfter(/databases/$(database)/documents/tickets/$(incoming().targetId))
+            && getAfter(/databases/$(database)/documents/tickets/$(incoming().targetId)).data.createdByUid == request.auth.uid
+          )
+          || (
+            incoming().action == 'ai.self_resolved'
+            && isValidId(incoming().targetId)
+            && !exists(/databases/$(database)/documents/aiResolutions/$(incoming().targetId))
+            && existsAfter(/databases/$(database)/documents/aiResolutions/$(incoming().targetId))
+            && getAfter(/databases/$(database)/documents/aiResolutions/$(incoming().targetId)).data.createdByUid == request.auth.uid
+          )
+        );
       allow update, delete: if false;
     }
   }

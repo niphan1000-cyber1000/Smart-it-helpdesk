@@ -17,19 +17,24 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: 'npm'
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Setup Bun (matches bun.lock)
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies from bun.lock
+        run: bun install --frozen-lockfile
 
       - name: TypeScript typecheck
-        run: npm run lint
+        run: bun run lint
 
       - name: Lint Firestore security rules
-        run: npm run lint:rules
+        run: bun run lint:rules
 
       - name: Run automated security and RBAC tests
-        run: npm test
+        run: bun run test
 
       - name: Build production bundle
-        run: npm run build
+        run: bun run build
+
+      - name: Run Firestore Emulator Security Tests
+        run: npx --yes firebase-tools@14 emulators:exec --only firestore --project demo-it-helpdesk "bun run test"
