@@ -15,7 +15,12 @@ import {
   SlidingWindowRateLimiter,
   validateWebhookUrlStructure,
 } from '../server/security.ts';
-import { getPermissionsForRole, hasPermission } from '../src/types/ticket.ts';
+import {
+  canAccessAdminDashboard,
+  getPermissionsForRole,
+  hasPermission,
+  resolveAccessFromSignals,
+} from '../src/types/ticket.ts';
 import { createInitialMockTickets } from '../src/data/mockTickets.ts';
 import { resolveSeedCounterPlan } from '../src/utils/ticketCounter.ts';
 import {
@@ -800,5 +805,42 @@ describe('Modular Backend Services & Routers', () => {
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+  });
+
+  it('Frontend UI visibility: gates IT Support Dashboard exclusively via verified admin Custom Claim or API/DB allowlist', () => {
+    const claimAdminAccess = resolveAccessFromSignals({
+      emailVerified: true,
+      hasTokenAdminClaim: true,
+      apiSession: { isAdmin: true, claims: { admin: true }, authSource: 'custom_claim' },
+    });
+    assert.equal(claimAdminAccess.role, 'admin');
+    assert.equal(claimAdminAccess.hasAdminClaim, true);
+    assert.equal(canAccessAdminDashboard(claimAdminAccess.permissions), true);
+
+    const apiAllowlistAccess = resolveAccessFromSignals({
+      emailVerified: true,
+      hasTokenAdminClaim: false,
+      apiSession: { isAdmin: true, claims: { admin: false }, authSource: 'allowlist_or_db' },
+    });
+    assert.equal(apiAllowlistAccess.role, 'admin');
+    assert.equal(canAccessAdminDashboard(apiAllowlistAccess.permissions), true);
+
+    const regularUserAccess = resolveAccessFromSignals({
+      emailVerified: true,
+      hasTokenAdminClaim: false,
+      apiSession: { isAdmin: false, claims: { admin: false }, authSource: 'standard' },
+      isEnvAdmin: false,
+      hasAdminsDoc: false,
+    });
+    assert.equal(regularUserAccess.role, 'employee');
+    assert.equal(canAccessAdminDashboard(regularUserAccess.permissions), false);
+
+    const unverifiedClaimAccess = resolveAccessFromSignals({
+      emailVerified: false,
+      hasTokenAdminClaim: true,
+      apiSession: { isAdmin: true, claims: { admin: true }, authSource: 'custom_claim' },
+    });
+    assert.equal(unverifiedClaimAccess.role, 'employee');
+    assert.equal(canAccessAdminDashboard(unverifiedClaimAccess.permissions), false);
   });
 });

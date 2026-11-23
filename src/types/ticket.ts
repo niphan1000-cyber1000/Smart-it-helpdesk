@@ -78,6 +78,103 @@ export function hasPermission(
   return permissions.includes(permission);
 }
 
+export type AdminAuthSource =
+  | 'custom_claim'
+  | 'allowlist_or_db'
+  | 'env'
+  | 'admins_doc'
+  | 'standard';
+
+export interface UserAccessProfile {
+  role: UserRole;
+  permissions: Permission[];
+  hasAdminClaim: boolean;
+  authSource: AdminAuthSource;
+}
+
+export interface AccessSignalInput {
+  emailVerified: boolean;
+  hasTokenAdminClaim: boolean;
+  apiSession?: {
+    isAdmin?: boolean;
+    claims?: { admin?: boolean };
+    authSource?: AdminAuthSource;
+  } | null;
+  isEnvAdmin?: boolean;
+  hasAdminsDoc?: boolean;
+}
+
+export function canAccessAdminDashboard(
+  permissions: readonly Permission[]
+): boolean {
+  return hasPermission(permissions, 'ticket:read_all');
+}
+
+export function resolveAccessFromSignals(
+  signals: AccessSignalInput
+): UserAccessProfile {
+  if (!signals.emailVerified) {
+    return {
+      role: 'employee',
+      permissions: getPermissionsForRole('employee'),
+      hasAdminClaim: false,
+      authSource: 'standard',
+    };
+  }
+
+  if (signals.apiSession?.claims?.admin === true) {
+    return {
+      role: 'admin',
+      permissions: getPermissionsForRole('admin'),
+      hasAdminClaim: true,
+      authSource: 'custom_claim',
+    };
+  }
+
+  if (signals.apiSession?.isAdmin === true) {
+    return {
+      role: 'admin',
+      permissions: getPermissionsForRole('admin'),
+      hasAdminClaim: false,
+      authSource: signals.apiSession.authSource || 'allowlist_or_db',
+    };
+  }
+
+  if (signals.hasTokenAdminClaim) {
+    return {
+      role: 'admin',
+      permissions: getPermissionsForRole('admin'),
+      hasAdminClaim: true,
+      authSource: 'custom_claim',
+    };
+  }
+
+  if (signals.isEnvAdmin) {
+    return {
+      role: 'admin',
+      permissions: getPermissionsForRole('admin'),
+      hasAdminClaim: false,
+      authSource: 'env',
+    };
+  }
+
+  if (signals.hasAdminsDoc) {
+    return {
+      role: 'admin',
+      permissions: getPermissionsForRole('admin'),
+      hasAdminClaim: false,
+      authSource: 'admins_doc',
+    };
+  }
+
+  return {
+    role: 'employee',
+    permissions: getPermissionsForRole('employee'),
+    hasAdminClaim: false,
+    authSource: 'standard',
+  };
+}
+
 export type AuditAction =
   | 'ticket.created'
   | 'ticket.updated'

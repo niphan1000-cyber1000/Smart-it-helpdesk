@@ -17,6 +17,7 @@ import { db, handleFirestoreError, OperationType } from '../firebase';
 import { createInitialMockTickets } from '../data/mockTickets';
 import { formatTicketId, resolveSeedCounterPlan } from '../utils/ticketCounter';
 import {
+  AdminAuthSource,
   AuditAction,
   AuditLogEntry,
   getPermissionsForRole,
@@ -24,7 +25,9 @@ import {
   Permission,
   ProblemCategory,
   RepairTicket,
+  resolveAccessFromSignals,
   TicketStatus,
+  UserAccessProfile,
   UserRole,
 } from '../types/ticket';
 
@@ -90,51 +93,34 @@ function makeAuditId(): string {
   return `aud-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-export type AdminAuthSource =
-  | 'custom_claim'
-  | 'allowlist_or_db'
-  | 'env'
-  | 'admins_doc'
-  | 'standard';
-
-export interface UserAccessProfile {
-  role: UserRole;
-  permissions: Permission[];
-  hasAdminClaim: boolean;
-  authSource: AdminAuthSource;
-}
+export type { AdminAuthSource, UserAccessProfile };
 
 export async function resolveUserAccess(
   user: User,
   forceRefresh = false
 ): Promise<UserAccessProfile> {
   if (!user.emailVerified) {
-    return {
-      role: 'employee',
-      permissions: getPermissionsForRole('employee'),
-      hasAdminClaim: false,
-      authSource: 'standard',
-    };
+    return resolveAccessFromSignals({
+      emailVerified: false,
+      hasTokenAdminClaim: false,
+    });
   }
 
-  let hasAdminClaim = false;
+  let hasTokenAdminClaim = false;
   let idToken = '';
   try {
     const tokenResult = await user.getIdTokenResult(forceRefresh);
-    hasAdminClaim = tokenResult.claims.admin === true;
+    hasTokenAdminClaim = tokenResult.claims.admin === true;
     idToken = tokenResult.token;
   } catch {
     // Fallback to environment list, backend session, or Firestore lookup
   }
 
-  if (hasAdminClaim) {
-    return {
-      role: 'admin',
-      permissions: getPermissionsForRole('admin'),
-      hasAdminClaim: true,
-      authSource: 'custom_claim',
-    };
-  }
+  let apiSession: {
+    isAdmin?: boolean;
+    claims?: { admin?: boolean };
+    authSource?: AdminAuthSource;
+  } | null = null;
 
   if (idToken) {
     try {
@@ -146,55 +132,38 @@ export async function resolveUserAccess(
         signal: AbortSignal.timeout(4000),
       });
       if (res.ok) {
-        const session = (await res.json()) as {
+        apiSession = (await res.json()) as {
           isAdmin?: boolean;
           claims?: { admin?: boolean };
           authSource?: AdminAuthSource;
         };
-        const claimAdmin = Boolean(session.claims?.admin);
-        if (claimAdmin || session.isAdmin) {
-          return {
-            role: 'admin',
-            permissions: getPermissionsForRole('admin'),
-            hasAdminClaim: claimAdmin,
-            authSource: claimAdmin ? 'custom_claim' : session.authSource || 'allowlist_or_db',
-          };
-        }
       }
     } catch {
-      // Fallback gracefully to client env / Firestore lookup if API is unreachable
+      // Fallback gracefully to token claim / client env / Firestore lookup if API is unreachable
     }
   }
 
-  if (user.email && ENV_ADMIN_EMAILS.includes(user.email.toLowerCase())) {
-    return {
-      role: 'admin',
-      permissions: getPermissionsForRole('admin'),
-      hasAdminClaim: false,
-      authSource: 'env',
-    };
-  }
+  const isEnvAdmin = Boolean(
+    user.email && ENV_ADMIN_EMAILS.includes(user.email.toLowerCase())
+  );
 
-  try {
-    const adminSnap = await getDoc(doc(db, 'admins', user.uid));
-    if (adminSnap.exists()) {
-      return {
-        role: 'admin',
-        permissions: getPermissionsForRole('admin'),
-        hasAdminClaim: false,
-        authSource: 'admins_doc',
-      };
+  let hasAdminsDoc = false;
+  if (!apiSession?.isAdmin && !hasTokenAdminClaim && !isEnvAdmin) {
+    try {
+      const adminSnap = await getDoc(doc(db, 'admins', user.uid));
+      hasAdminsDoc = adminSnap.exists();
+    } catch {
+      // Non-admin users receive permission-denied or not-found gracefully
     }
-  } catch {
-    // Non-admin users receive permission-denied or not-found gracefully
   }
 
-  return {
-    role: 'employee',
-    permissions: getPermissionsForRole('employee'),
-    hasAdminClaim: false,
-    authSource: 'standard',
-  };
+  return resolveAccessFromSignals({
+    emailVerified: user.emailVerified,
+    hasTokenAdminClaim,
+    apiSession,
+    isEnvAdmin,
+    hasAdminsDoc,
+  });
 }
 
 export function subscribeToTickets(

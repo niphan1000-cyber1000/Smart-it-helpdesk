@@ -32,6 +32,7 @@ import {
 import {
   AppViewMode,
   AuditLogEntry,
+  canAccessAdminDashboard,
   getPermissionsForRole,
   hasPermission,
   NewTicketInput,
@@ -61,7 +62,7 @@ export default function App() {
   const [refreshingAccess, setRefreshingAccess] = useState(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
-  const isAdmin = hasPermission(permissions, 'ticket:read_all');
+  const isAdmin = canAccessAdminDashboard(permissions);
 
   const showToast = useCallback((message: string) => {
     setToastMessage(message);
@@ -69,18 +70,23 @@ export default function App() {
 
   // Firebase ID Token listener (reacts to Custom Claims admin: true updates + API session check)
   useEffect(() => {
+    let active = true;
     const unsubscribe = onIdTokenChanged(auth, async (nextUser) => {
+      if (!active) return;
       setUser(nextUser);
       if (nextUser) {
         const access = await resolveUserAccess(nextUser);
+        if (!active) return;
         setPermissions(access.permissions);
-        const adminAllowed = hasPermission(access.permissions, 'ticket:read_all');
+        const adminAllowed = canAccessAdminDashboard(access.permissions);
         if (!adminAllowed) {
           setActiveMode('user');
         }
         if (hasPermission(access.permissions, 'webhook:manage')) {
           fetchWebhookStatus(nextUser)
-            .then((res) => setWebhookConfigured(res.configured))
+            .then((res) => {
+              if (active) setWebhookConfigured(res.configured);
+            })
             .catch(() => {});
         } else {
           setWebhookConfigured(false);
@@ -94,9 +100,12 @@ export default function App() {
         setWebhookConfigured(false);
         setTicketsLoading(false);
       }
-      setAuthReady(true);
+      if (active) setAuthReady(true);
     });
-    return () => unsubscribe();
+    return () => {
+      active = false;
+      unsubscribe();
+    };
   }, []);
 
   const handleRefreshAccess = useCallback(async () => {
