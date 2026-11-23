@@ -90,7 +90,12 @@ describe('Firestore Rules Dirty Dozen & Security Invariants', () => {
     assert.match(rulesSource, /isValidStepElement\(ai\.steps, 4\)/);
   });
 
-  it('10 & F-09: prevents self-escalation into /admins and enforces /auditLogs trust boundary + atomicity', () => {
+  it('10 & F-09: prevents self-escalation into /admins, avoids hardcoded personal emails, and enforces custom-claim or /admins/{uid} RBAC + /auditLogs atomicity', () => {
+    assert.doesNotMatch(rulesSource, /@gmail\.com/);
+    assert.match(
+      rulesSource,
+      /function hasAdminClaim\(\)\s*\{\s*return isSignedIn\(\) && request\.auth\.token\.get\('admin', false\) == true;\s*\}/
+    );
     assert.match(
       rulesSource,
       /match \/admins\/\{uid\}[\s\S]*?allow create:\s*if isSignedIn\(\)[\s\S]*?isAdmin\(\)/
@@ -113,6 +118,7 @@ if (emulatorHost) {
     sub: string;
     email: string;
     email_verified: boolean;
+    admin?: boolean;
   }): string {
     const header = Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url');
     const payload = Buffer.from(
@@ -124,6 +130,7 @@ if (emulatorHost) {
         sub: claims.sub,
         email: claims.email,
         email_verified: claims.email_verified,
+        ...(claims.admin ? { admin: true } : {}),
       })
     ).toString('base64url');
     return `${header}.${payload}.`;
@@ -139,10 +146,17 @@ if (emulatorHost) {
     email: 'unverified@company.co.th',
     email_verified: false,
   });
+  const unverifiedAdminClaimToken = makeEmulatorJwt({
+    sub: 'unverified-admin-uid',
+    email: 'unverified-admin@company.co.th',
+    email_verified: false,
+    admin: true,
+  });
   const adminToken = makeEmulatorJwt({
     sub: 'admin-uid-1',
-    email: 'niphan1000@gmail.com',
+    email: 'it-admin@company.co.th',
     email_verified: true,
+    admin: true,
   });
 
   async function commitWrites(token: string | null, writes: unknown[]): Promise<Response> {
@@ -546,6 +560,12 @@ if (emulatorHost) {
       });
       assert.equal(empDelete.status, 403);
 
+      // Unverified email with admin:true claim must still be denied admin list access
+      const unverifiedAdminList = await fetch(`${baseUrl}/tickets`, {
+        headers: { Authorization: `Bearer ${unverifiedAdminClaimToken}` },
+      });
+      assert.equal(unverifiedAdminList.status, 403);
+
       // Valid admin update + atomic ticket.updated audit succeeds
       const adminUpdate = await commitWrites(adminToken, [
         {
@@ -566,7 +586,7 @@ if (emulatorHost) {
               action: { stringValue: 'ticket.updated' },
               targetId: { stringValue: 'IT-2026-001' },
               actorUid: { stringValue: 'admin-uid-1' },
-              actorEmail: { stringValue: 'niphan1000@gmail.com' },
+              actorEmail: { stringValue: 'it-admin@company.co.th' },
               summary: { stringValue: 'อัปเดตสถานะ IT-2026-001' },
             },
           },
@@ -586,7 +606,7 @@ if (emulatorHost) {
               action: { stringValue: 'ticket.deleted' },
               targetId: { stringValue: 'IT-2026-001' },
               actorUid: { stringValue: 'admin-uid-1' },
-              actorEmail: { stringValue: 'niphan1000@gmail.com' },
+              actorEmail: { stringValue: 'it-admin@company.co.th' },
               summary: { stringValue: 'ลบใบแจ้งซ่อม IT-2026-001' },
             },
           },
@@ -621,7 +641,7 @@ if (emulatorHost) {
             fields: buildTicketFields({
               id: { stringValue: 'IT-2026-005' },
               createdByUid: { stringValue: 'admin-uid-1' },
-              createdByEmail: { stringValue: 'niphan1000@gmail.com' },
+              createdByEmail: { stringValue: 'it-admin@company.co.th' },
             }),
           },
           currentDocument: { exists: false },
@@ -651,7 +671,7 @@ if (emulatorHost) {
             fields: buildTicketFields({
               id: { stringValue: 'IT-2026-005' },
               createdByUid: { stringValue: 'admin-uid-1' },
-              createdByEmail: { stringValue: 'niphan1000@gmail.com' },
+              createdByEmail: { stringValue: 'it-admin@company.co.th' },
             }),
           },
           currentDocument: { exists: false },
@@ -667,7 +687,7 @@ if (emulatorHost) {
               action: { stringValue: 'admin.demo_seeded' },
               targetId: { stringValue: 'tickets' },
               actorUid: { stringValue: 'admin-uid-1' },
-              actorEmail: { stringValue: 'niphan1000@gmail.com' },
+              actorEmail: { stringValue: 'it-admin@company.co.th' },
               summary: { stringValue: 'เพิ่มข้อมูลตัวอย่างลงฐานข้อมูล Firestore' },
             },
           },

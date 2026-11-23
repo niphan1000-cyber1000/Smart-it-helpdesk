@@ -28,7 +28,10 @@ import {
   UserRole,
 } from '../types/ticket';
 
-export const BOOTSTRAPPED_ADMIN_EMAIL = 'niphan1000@gmail.com';
+const ENV_ADMIN_EMAILS: string[] = String(import.meta.env.VITE_ADMIN_EMAILS || '')
+  .split(',')
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
 
 function toIsoString(val: unknown): string {
   if (val instanceof Timestamp) {
@@ -97,7 +100,16 @@ export async function resolveUserAccess(user: User): Promise<UserAccessProfile> 
     return { role: 'employee', permissions: getPermissionsForRole('employee') };
   }
 
-  if (user.email === BOOTSTRAPPED_ADMIN_EMAIL) {
+  try {
+    const tokenResult = await user.getIdTokenResult();
+    if (tokenResult.claims.admin === true) {
+      return { role: 'admin', permissions: getPermissionsForRole('admin') };
+    }
+  } catch {
+    // Fallback to environment list or Firestore lookup
+  }
+
+  if (user.email && ENV_ADMIN_EMAILS.includes(user.email.toLowerCase())) {
     return { role: 'admin', permissions: getPermissionsForRole('admin') };
   }
 
@@ -412,7 +424,7 @@ export async function seedDemoTicketsToFirestore(user: User): Promise<void> {
           status: ticket.status,
           resolutionNote: ticket.resolutionNote.slice(0, 2000),
           createdByUid: user.uid,
-          createdByEmail: user.email || BOOTSTRAPPED_ADMIN_EMAIL,
+          createdByEmail: user.email || 'admin@company.local',
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
           completedAt: ticket.status === 'เสร็จสิ้น' ? serverTimestamp() : null,

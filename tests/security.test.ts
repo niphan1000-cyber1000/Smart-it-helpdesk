@@ -24,6 +24,7 @@ import {
 import { getWebhookStatusInfo } from '../server/services/webhook.ts';
 import { createAiRouter } from '../server/routes/aiRoutes.ts';
 import { createWebhookRouter } from '../server/routes/webhookRoutes.ts';
+import { hasAdminAccessClaimOrEnv } from '../server/auth.ts';
 
 describe('SlidingWindowRateLimiter', () => {
   it('allows requests up to maxRequests and blocks excess until window expires', () => {
@@ -508,5 +509,36 @@ describe('Modular Backend Services & Routers', () => {
     const status = getWebhookStatusInfo();
     assert.ok(['env', 'runtime', 'none'].includes(status.source));
     assert.equal(typeof status.configured, 'boolean');
+  });
+
+  it('evaluates admin access via custom claim or ADMIN_EMAILS env only when email is verified', () => {
+    assert.equal(
+      hasAdminAccessClaimOrEnv(
+        { email: 'admin@corp.local', emailVerified: true, isAdminClaim: true },
+        []
+      ),
+      true
+    );
+    assert.equal(
+      hasAdminAccessClaimOrEnv(
+        { email: 'admin@corp.local', emailVerified: false, isAdminClaim: true },
+        ['admin@corp.local']
+      ),
+      false
+    );
+    assert.equal(
+      hasAdminAccessClaimOrEnv(
+        { email: 'IT-Lead@Corp.Local', emailVerified: true, isAdminClaim: false },
+        ['it-lead@corp.local']
+      ),
+      true
+    );
+    assert.equal(
+      hasAdminAccessClaimOrEnv(
+        { email: 'employee@corp.local', emailVerified: true, isAdminClaim: false },
+        ['it-lead@corp.local']
+      ),
+      false
+    );
   });
 });

@@ -10,7 +10,14 @@ const ROOT_DIR = path.resolve(__dirname, '..');
 
 export const PORT = Number(process.env.PORT) || 3000;
 export const MODEL_NAME = 'gemini-2.5-flash';
-export const ADMIN_EMAIL = 'niphan1000@gmail.com';
+export const ADMIN_EMAILS: string[] = (
+  process.env.ADMIN_EMAILS ||
+  process.env.ADMIN_EMAIL ||
+  ''
+)
+  .split(',')
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
 export const MAX_GEMINI_OUTPUT_TOKENS = 1024;
 export const PROJECT_ROOT_DIR = ROOT_DIR;
 

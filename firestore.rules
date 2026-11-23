@@ -23,12 +23,12 @@ service cloud.firestore {
       return request.auth != null && request.auth.token.email_verified == true;
     }
 
-    function isBootstrappedAdmin() {
-      return isSignedIn() && request.auth.token.email == 'niphan1000@gmail.com';
+    function hasAdminClaim() {
+      return isSignedIn() && request.auth.token.get('admin', false) == true;
     }
 
     function isAdmin() {
-      return isBootstrappedAdmin() || (
+      return hasAdminClaim() || (
         isSignedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid))
       );
     }

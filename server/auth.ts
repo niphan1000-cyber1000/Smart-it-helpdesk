@@ -1,6 +1,6 @@
 import type { Request } from 'express';
 import {
-  ADMIN_EMAIL,
+  ADMIN_EMAILS,
   FIREBASE_PROJECT_ID,
   FIREBASE_WEB_API_KEY,
   FIRESTORE_DATABASE_ID,
@@ -12,6 +12,7 @@ export interface VerifiedUser {
   uid: string;
   email: string;
   emailVerified: boolean;
+  isAdminClaim: boolean;
   idToken: string;
 }
 
@@ -38,16 +39,29 @@ export async function verifyFirebaseBearerToken(req: Request): Promise<VerifiedU
         localId?: string;
         email?: string;
         emailVerified?: boolean;
+        customAttributes?: string;
       }>;
     };
     const user = data.users?.[0];
     if (!user || !user.localId || !user.email || !user.emailVerified) {
       return null;
     }
+
+    let isAdminClaim = false;
+    if (typeof user.customAttributes === 'string' && user.customAttributes.trim()) {
+      try {
+        const claims = JSON.parse(user.customAttributes) as Record<string, unknown>;
+        isAdminClaim = claims.admin === true;
+      } catch {
+        isAdminClaim = false;
+      }
+    }
+
     return {
       uid: user.localId,
       email: user.email,
       emailVerified: Boolean(user.emailVerified),
+      isAdminClaim,
       idToken,
     };
   } catch {
@@ -55,9 +69,18 @@ export async function verifyFirebaseBearerToken(req: Request): Promise<VerifiedU
   }
 }
 
+export function hasAdminAccessClaimOrEnv(
+  user: Pick<VerifiedUser, 'email' | 'emailVerified' | 'isAdminClaim'>,
+  adminEmails: string[] = ADMIN_EMAILS
+): boolean {
+  if (!user.emailVerified) return false;
+  if (user.isAdminClaim) return true;
+  return adminEmails.includes(user.email.toLowerCase());
+}
+
 export async function isAdminUser(user: VerifiedUser): Promise<boolean> {
   if (!user.emailVerified) return false;
-  if (user.email === ADMIN_EMAIL) return true;
+  if (hasAdminAccessClaimOrEnv(user)) return true;
   if (!FIREBASE_PROJECT_ID) return false;
 
   try {
