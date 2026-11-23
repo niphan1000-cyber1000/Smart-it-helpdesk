@@ -1,8 +1,10 @@
 import type { Request } from 'express';
+import { getApp, getApps, initializeApp } from 'firebase-admin/app';
+import { getAuth } from 'firebase-admin/auth';
+import type { DecodedIdToken } from 'firebase-admin/auth';
 import {
   ADMIN_EMAILS,
   FIREBASE_PROJECT_ID,
-  FIREBASE_WEB_API_KEY,
   FIRESTORE_DATABASE_ID,
 } from './config.ts';
 import { parseFirestoreTicketDocument } from './security.ts';
@@ -16,54 +18,45 @@ export interface VerifiedUser {
   idToken: string;
 }
 
+function getFirebaseAdminAuth() {
+  if (!FIREBASE_PROJECT_ID || FIREBASE_PROJECT_ID === 'remixed-project-id') {
+    return null;
+  }
+  const app = getApps().length
+    ? getApp()
+    : initializeApp({ projectId: FIREBASE_PROJECT_ID });
+  return getAuth(app);
+}
+
+export function extractVerifiedUserFromClaims(
+  decodedToken: Pick<DecodedIdToken, 'uid' | 'email' | 'email_verified'> & Record<string, unknown>,
+  idToken: string
+): VerifiedUser | null {
+  if (!decodedToken.uid || !decodedToken.email || decodedToken.email_verified !== true) {
+    return null;
+  }
+
+  return {
+    uid: decodedToken.uid,
+    email: decodedToken.email,
+    emailVerified: true,
+    isAdminClaim: decodedToken.admin === true,
+    idToken,
+  };
+}
+
 export async function verifyFirebaseBearerToken(req: Request): Promise<VerifiedUser | null> {
-  if (!FIREBASE_WEB_API_KEY) return null;
+  const adminAuth = getFirebaseAdminAuth();
+  if (!adminAuth) return null;
+
   const authHeader = req.headers.authorization || '';
   if (!authHeader.startsWith('Bearer ')) return null;
   const idToken = authHeader.slice(7).trim();
   if (!idToken) return null;
 
   try {
-    const res = await fetch(
-      `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(FIREBASE_WEB_API_KEY)}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ idToken }),
-        signal: AbortSignal.timeout(6000),
-      }
-    );
-    if (!res.ok) return null;
-    const data = (await res.json()) as {
-      users?: Array<{
-        localId?: string;
-        email?: string;
-        emailVerified?: boolean;
-        customAttributes?: string;
-      }>;
-    };
-    const user = data.users?.[0];
-    if (!user || !user.localId || !user.email || !user.emailVerified) {
-      return null;
-    }
-
-    let isAdminClaim = false;
-    if (typeof user.customAttributes === 'string' && user.customAttributes.trim()) {
-      try {
-        const claims = JSON.parse(user.customAttributes) as Record<string, unknown>;
-        isAdminClaim = claims.admin === true;
-      } catch {
-        isAdminClaim = false;
-      }
-    }
-
-    return {
-      uid: user.localId,
-      email: user.email,
-      emailVerified: Boolean(user.emailVerified),
-      isAdminClaim,
-      idToken,
-    };
+    const decodedToken = await adminAuth.verifyIdToken(idToken);
+    return extractVerifiedUserFromClaims(decodedToken, idToken);
   } catch {
     return null;
   }
@@ -78,9 +71,20 @@ export function hasAdminAccessClaimOrEnv(
   return adminEmails.includes(user.email.toLowerCase());
 }
 
-export async function isAdminUser(user: VerifiedUser): Promise<boolean> {
+export async function isAdminUser(
+  user: VerifiedUser,
+  options?: {
+    adminEmails?: string[];
+    checkAdminsCollection?: (uid: string, idToken: string) => Promise<boolean>;
+  }
+): Promise<boolean> {
   if (!user.emailVerified) return false;
-  if (hasAdminAccessClaimOrEnv(user)) return true;
+  if (hasAdminAccessClaimOrEnv(user, options?.adminEmails ?? ADMIN_EMAILS)) return true;
+
+  if (options?.checkAdminsCollection) {
+    return options.checkAdminsCollection(user.uid, user.idToken);
+  }
+
   if (!FIREBASE_PROJECT_ID) return false;
 
   try {

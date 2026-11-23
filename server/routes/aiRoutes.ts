@@ -53,11 +53,18 @@ async function enforceAiRateLimit(
   return true;
 }
 
-export function createAiRouter(): Router {
+export interface AiRouterDeps {
+  verifyToken?: (req: Request) => Promise<VerifiedUser | null>;
+  checkAdmin?: (user: VerifiedUser) => Promise<boolean>;
+}
+
+export function createAiRouter(deps?: AiRouterDeps): Router {
   const router = Router();
+  const verifyToken = deps?.verifyToken ?? verifyFirebaseBearerToken;
+  const checkAdmin = deps?.checkAdmin ?? isAdminUser;
 
   router.get('/status', async (req: Request, res: Response) => {
-    const user = await verifyFirebaseBearerToken(req);
+    const user = await verifyToken(req);
     if (!user) {
       res.status(401).json({ error: 'กรุณาเข้าสู่ระบบก่อนตรวจสอบสถานะ' });
       return;
@@ -70,7 +77,7 @@ export function createAiRouter(): Router {
 
   // User Portal: AI Troubleshooting Assistant (Authenticated + Rate-limited)
   router.post('/troubleshoot', async (req: Request, res: Response) => {
-    const user = await verifyFirebaseBearerToken(req);
+    const user = await verifyToken(req);
     if (!user) {
       res.status(401).json({ error: 'กรุณาเข้าสู่ระบบด้วยบัญชี Google ก่อนใช้งานผู้ช่วย AI' });
       return;
@@ -101,13 +108,13 @@ export function createAiRouter(): Router {
 
   // IT Admin Dashboard: Deep Technical Diagnostic (Admin-only + Rate-limited)
   router.post('/diagnostic', async (req: Request, res: Response) => {
-    const user = await verifyFirebaseBearerToken(req);
+    const user = await verifyToken(req);
     if (!user) {
       res.status(401).json({ error: 'กรุณาเข้าสู่ระบบก่อนใช้งานการวิเคราะห์เชิงลึก' });
       return;
     }
 
-    const adminAuthorized = await isAdminUser(user);
+    const adminAuthorized = await checkAdmin(user);
     if (!adminAuthorized) {
       res.status(403).json({
         error: 'สิทธิ์การใช้งานการวิเคราะห์เชิงลึกสงวนไว้สำหรับเจ้าหน้าที่ไอที (IT Admin) เท่านั้น',

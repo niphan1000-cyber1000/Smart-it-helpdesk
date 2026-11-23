@@ -1,6 +1,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
+import express from 'express';
+import type { Request } from 'express';
 import {
   createPinnedLookup,
   createRateLimiter,
@@ -25,7 +27,13 @@ import { getWebhookStatusInfo } from '../server/services/webhook.ts';
 import { createAiRouter } from '../server/routes/aiRoutes.ts';
 import { buildAuthSessionPayload, createAuthRouter } from '../server/routes/authRoutes.ts';
 import { createWebhookRouter } from '../server/routes/webhookRoutes.ts';
-import { hasAdminAccessClaimOrEnv } from '../server/auth.ts';
+import {
+  extractVerifiedUserFromClaims,
+  hasAdminAccessClaimOrEnv,
+  isAdminUser,
+  verifyFirebaseBearerToken,
+} from '../server/auth.ts';
+import type { VerifiedUser } from '../server/auth.ts';
 
 describe('SlidingWindowRateLimiter', () => {
   it('allows requests up to maxRequests and blocks excess until window expires', () => {
@@ -568,5 +576,229 @@ describe('Modular Backend Services & Routers', () => {
     });
     assert.equal(unverifiedSession.isAdmin, false);
     assert.equal(unverifiedSession.role, 'employee');
+  });
+
+  it('extracts admin Custom Claim from verified Firebase decoded token and rejects unverified or tampered tokens', async () => {
+    const claimOnlyAdmin = extractVerifiedUserFromClaims(
+      {
+        uid: 'uid-claim-only',
+        email: 'claim-tech@corp.local',
+        email_verified: true,
+        admin: true,
+      },
+      'verified-id-token'
+    );
+    assert.ok(claimOnlyAdmin);
+    assert.equal(claimOnlyAdmin.isAdminClaim, true);
+
+    // Confirm admin access succeeds with ONLY Custom Claim (no ADMIN_EMAILS, no /admins/{uid} doc)
+    const allowed = await isAdminUser(claimOnlyAdmin, {
+      adminEmails: [],
+      checkAdminsCollection: async () => false,
+    });
+    assert.equal(allowed, true);
+
+    // Standard verified employee with neither claim, env email, nor /admins/{uid} doc must be denied
+    const regularEmployee = extractVerifiedUserFromClaims(
+      {
+        uid: 'uid-emp',
+        email: 'emp@corp.local',
+        email_verified: true,
+      },
+      'verified-emp-token'
+    );
+    assert.ok(regularEmployee);
+    assert.equal(regularEmployee.isAdminClaim, false);
+    const empAllowed = await isAdminUser(regularEmployee, {
+      adminEmails: [],
+      checkAdminsCollection: async () => false,
+    });
+    assert.equal(empAllowed, false);
+
+    // Unverified user with admin:true claim is rejected outright
+    assert.equal(
+      extractVerifiedUserFromClaims(
+        {
+          uid: 'uid-unverified',
+          email: 'unverified@corp.local',
+          email_verified: false,
+          admin: true,
+        },
+        'token'
+      ),
+      null
+    );
+
+    // Malformed / unsigned bearer token fails real firebase-admin verifyIdToken()
+    const badReq = { headers: { authorization: 'Bearer invalid.jwt.token' } } as Request;
+    assert.equal(await verifyFirebaseBearerToken(badReq), null);
+  });
+
+  it('HTTP integration: enforces Custom Claim (admin: true) across /api/auth/session, /api/ai/diagnostic, and /api/webhook/*', async () => {
+    const claimOnlyAdminUser: VerifiedUser = {
+      uid: 'claim-only-admin-1',
+      email: 'tech-claim@corp.local',
+      emailVerified: true,
+      isAdminClaim: true,
+      idToken: 'token-claim-admin',
+    };
+    const standardEmployeeUser: VerifiedUser = {
+      uid: 'emp-standard-1',
+      email: 'user@corp.local',
+      emailVerified: true,
+      isAdminClaim: false,
+      idToken: 'token-standard-user',
+    };
+
+    const mockVerifyToken = async (req: Request): Promise<VerifiedUser | null> => {
+      const auth = req.headers.authorization || '';
+      if (auth === 'Bearer token-claim-admin') return claimOnlyAdminUser;
+      if (auth === 'Bearer token-standard-user') return standardEmployeeUser;
+      return null;
+    };
+
+    // Explicitly prove no ADMIN_EMAILS and no /admins/{uid} doc exist for claimOnlyAdminUser
+    const strictCheckAdmin = (user: VerifiedUser) =>
+      isAdminUser(user, {
+        adminEmails: [],
+        checkAdminsCollection: async () => false,
+      });
+
+    const app = express();
+    app.use(express.json({ limit: '256kb' }));
+    app.use('/api/auth', createAuthRouter({ verifyToken: mockVerifyToken, checkAdmin: strictCheckAdmin }));
+    app.use('/api/ai', createAiRouter({ verifyToken: mockVerifyToken, checkAdmin: strictCheckAdmin }));
+    app.use(
+      '/api/webhook',
+      createWebhookRouter({
+        verifyToken: mockVerifyToken,
+        checkAdmin: strictCheckAdmin,
+        writeAuditLog: async () => {},
+      })
+    );
+
+    const server = app.listen(0, '127.0.0.1');
+    await new Promise<void>((resolve) => server.once('listening', resolve));
+    const addr = server.address() as net.AddressInfo;
+    const base = `http://127.0.0.1:${addr.port}`;
+
+    try {
+      // 1. /api/auth/session unauthenticated -> 401
+      const unauthRes = await fetch(`${base}/api/auth/session`);
+      assert.equal(unauthRes.status, 401);
+
+      // 2. /api/auth/session as employee -> 200 isAdmin:false
+      const empSessionRes = await fetch(`${base}/api/auth/session`, {
+        headers: { Authorization: 'Bearer token-standard-user' },
+      });
+      assert.equal(empSessionRes.status, 200);
+      const empSession = (await empSessionRes.json()) as Record<string, unknown>;
+      assert.equal(empSession.isAdmin, false);
+      assert.equal(empSession.role, 'employee');
+      assert.equal(empSession.authSource, 'standard');
+
+      // 3. /api/auth/session as Custom-Claim-only admin -> 200 isAdmin:true, authSource:custom_claim
+      const adminSessionRes = await fetch(`${base}/api/auth/session`, {
+        headers: { Authorization: 'Bearer token-claim-admin' },
+      });
+      assert.equal(adminSessionRes.status, 200);
+      const adminSession = (await adminSessionRes.json()) as {
+        isAdmin: boolean;
+        role: string;
+        authSource: string;
+        claims: { admin: boolean };
+      };
+      assert.equal(adminSession.isAdmin, true);
+      assert.equal(adminSession.role, 'admin');
+      assert.equal(adminSession.authSource, 'custom_claim');
+      assert.equal(adminSession.claims.admin, true);
+
+      // 4. /api/ai/diagnostic: employee gets 403, Custom-Claim-only admin gets 200
+      const empDiagRes = await fetch(`${base}/api/ai/diagnostic`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer token-standard-user',
+        },
+        body: JSON.stringify({
+          ticketId: 'IT-2026-001',
+          category: 'อินเทอร์เน็ต/Wi-Fi มีปัญหา',
+          description: 'เชื่อมต่อ Wi-Fi ไม่ได้',
+        }),
+      });
+      assert.equal(empDiagRes.status, 403);
+
+      const adminDiagRes = await fetch(`${base}/api/ai/diagnostic`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer token-claim-admin',
+        },
+        body: JSON.stringify({
+          ticketId: 'IT-2026-001',
+          category: 'อินเทอร์เน็ต/Wi-Fi มีปัญหา',
+          description: 'เชื่อมต่อ Wi-Fi ไม่ได้',
+        }),
+      });
+      assert.equal(adminDiagRes.status, 200);
+      const diagBody = (await adminDiagRes.json()) as { data?: { rootCause?: string } };
+      assert.ok(diagBody.data?.rootCause);
+
+      // 5. /api/webhook/status & /api/webhook/config & /api/webhook/test: employee -> 403, Claim-only admin -> authorized
+      const empHookStatus = await fetch(`${base}/api/webhook/status`, {
+        headers: { Authorization: 'Bearer token-standard-user' },
+      });
+      assert.equal(empHookStatus.status, 403);
+
+      const adminHookStatus = await fetch(`${base}/api/webhook/status`, {
+        headers: { Authorization: 'Bearer token-claim-admin' },
+      });
+      assert.equal(adminHookStatus.status, 200);
+
+      const empHookConfig = await fetch(`${base}/api/webhook/config`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer token-standard-user',
+        },
+        body: JSON.stringify({ url: 'https://discord.com/api/webhooks/1/2', type: 'discord' }),
+      });
+      assert.equal(empHookConfig.status, 403);
+
+      // Claim-only admin reaches SSRF validation (400 on private URL, not 403)
+      const adminHookSsrf = await fetch(`${base}/api/webhook/config`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer token-claim-admin',
+        },
+        body: JSON.stringify({ url: 'https://127.0.0.1/hook', type: 'custom' }),
+      });
+      assert.equal(adminHookSsrf.status, 400);
+
+      // Claim-only admin reaches /api/webhook/test handler (400 when unconfigured, not 403)
+      const empHookTest = await fetch(`${base}/api/webhook/test`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer token-standard-user',
+        },
+        body: JSON.stringify({}),
+      });
+      assert.equal(empHookTest.status, 403);
+
+      const adminHookTest = await fetch(`${base}/api/webhook/test`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer token-claim-admin',
+        },
+        body: JSON.stringify({}),
+      });
+      assert.notEqual(adminHookTest.status, 401);
+      assert.notEqual(adminHookTest.status, 403);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 });

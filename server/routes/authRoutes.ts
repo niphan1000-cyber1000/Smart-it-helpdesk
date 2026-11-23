@@ -15,10 +15,16 @@ export interface AuthSessionPayload {
   authSource: 'custom_claim' | 'allowlist_or_db' | 'standard';
 }
 
+export interface AuthRouterDeps {
+  verifyToken?: (req: Request) => Promise<VerifiedUser | null>;
+  checkAdmin?: (user: VerifiedUser) => Promise<boolean>;
+}
+
 export async function buildAuthSessionPayload(
-  user: VerifiedUser
+  user: VerifiedUser,
+  checkAdmin: (user: VerifiedUser) => Promise<boolean> = isAdminUser
 ): Promise<AuthSessionPayload> {
-  const admin = await isAdminUser(user);
+  const admin = await checkAdmin(user);
   return {
     uid: user.uid,
     email: user.email,
@@ -36,17 +42,19 @@ export async function buildAuthSessionPayload(
   };
 }
 
-export function createAuthRouter(): Router {
+export function createAuthRouter(deps?: AuthRouterDeps): Router {
   const router = Router();
+  const verifyToken = deps?.verifyToken ?? verifyFirebaseBearerToken;
+  const checkAdmin = deps?.checkAdmin ?? isAdminUser;
 
   router.get('/session', async (req: Request, res: Response) => {
-    const user = await verifyFirebaseBearerToken(req);
+    const user = await verifyToken(req);
     if (!user) {
       res.status(401).json({ error: 'กรุณาเข้าสู่ระบบและยืนยันอีเมลก่อนตรวจสอบสิทธิ์' });
       return;
     }
 
-    const session = await buildAuthSessionPayload(user);
+    const session = await buildAuthSessionPayload(user, checkAdmin);
     res.json(session);
   });
 

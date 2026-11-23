@@ -7,6 +7,7 @@ import {
   verifyFirebaseBearerToken,
   writeBackendAuditLog,
 } from '../auth.ts';
+import type { VerifiedUser } from '../auth.ts';
 import {
   clearRuntimeWebhookConfig,
   dispatchWebhook,
@@ -16,17 +17,26 @@ import {
 } from '../services/webhook.ts';
 import type { WebhookType } from '../services/webhook.ts';
 
-export function createWebhookRouter(): Router {
+export interface WebhookRouterDeps {
+  verifyToken?: (req: Request) => Promise<VerifiedUser | null>;
+  checkAdmin?: (user: VerifiedUser) => Promise<boolean>;
+  writeAuditLog?: typeof writeBackendAuditLog;
+}
+
+export function createWebhookRouter(deps?: WebhookRouterDeps): Router {
   const router = Router();
+  const verifyToken = deps?.verifyToken ?? verifyFirebaseBearerToken;
+  const checkAdmin = deps?.checkAdmin ?? isAdminUser;
+  const writeAuditLog = deps?.writeAuditLog ?? writeBackendAuditLog;
 
   // Webhook Status (Admin only)
   router.get('/status', async (req: Request, res: Response) => {
-    const user = await verifyFirebaseBearerToken(req);
+    const user = await verifyToken(req);
     if (!user) {
       res.status(401).json({ error: 'กรุณาเข้าสู่ระบบ' });
       return;
     }
-    if (!(await isAdminUser(user))) {
+    if (!(await checkAdmin(user))) {
       res.status(403).json({ error: 'เฉพาะเจ้าหน้าที่ไอทีผู้ดูแลระบบเท่านั้น' });
       return;
     }
@@ -36,12 +46,12 @@ export function createWebhookRouter(): Router {
 
   // Configure runtime Webhook URL (Admin only, stored server-side)
   router.post('/config', async (req: Request, res: Response) => {
-    const user = await verifyFirebaseBearerToken(req);
+    const user = await verifyToken(req);
     if (!user) {
       res.status(401).json({ error: 'กรุณาเข้าสู่ระบบ' });
       return;
     }
-    if (!(await isAdminUser(user))) {
+    if (!(await checkAdmin(user))) {
       res.status(403).json({ error: 'เฉพาะเจ้าหน้าที่ไอทีผู้ดูแลระบบเท่านั้น' });
       return;
     }
@@ -55,7 +65,7 @@ export function createWebhookRouter(): Router {
 
     if (!url) {
       const status = clearRuntimeWebhookConfig();
-      await writeBackendAuditLog(user, {
+      await writeAuditLog(user, {
         action: 'webhook.config_updated',
         targetId: 'webhook',
         summary: 'ล้างการตั้งค่า Runtime Webhook ชั่วคราวผ่าน Trusted Backend',
@@ -70,7 +80,7 @@ export function createWebhookRouter(): Router {
       return;
     }
 
-    await writeBackendAuditLog(user, {
+    await writeAuditLog(user, {
       action: 'webhook.config_updated',
       targetId: 'webhook',
       summary: `อัปเดตการตั้งค่า Runtime Webhook (${type}) ผ่าน Trusted Backend`,
@@ -80,12 +90,12 @@ export function createWebhookRouter(): Router {
 
   // Send Test Webhook (Admin only)
   router.post('/test', async (req: Request, res: Response) => {
-    const user = await verifyFirebaseBearerToken(req);
+    const user = await verifyToken(req);
     if (!user) {
       res.status(401).json({ error: 'กรุณาเข้าสู่ระบบ' });
       return;
     }
-    if (!(await isAdminUser(user))) {
+    if (!(await checkAdmin(user))) {
       res.status(403).json({ error: 'เฉพาะเจ้าหน้าที่ไอทีผู้ดูแลระบบเท่านั้น' });
       return;
     }
@@ -123,7 +133,7 @@ export function createWebhookRouter(): Router {
 
   // Notify Webhook on New Repair Ticket (Verified against Firestore Ticket Ownership + Rate-limited)
   router.post('/notify', async (req: Request, res: Response) => {
-    const user = await verifyFirebaseBearerToken(req);
+    const user = await verifyToken(req);
     if (!user) {
       res.status(401).json({ error: 'กรุณาเข้าสู่ระบบก่อนส่งการแจ้งเตือน' });
       return;
@@ -168,7 +178,7 @@ export function createWebhookRouter(): Router {
     }
 
     const callerIsOwner = verifiedTicket.createdByUid === user.uid;
-    if (!callerIsOwner && !(await isAdminUser(user))) {
+    if (!callerIsOwner && !(await checkAdmin(user))) {
       res.status(403).json({ error: 'ไม่มีสิทธิ์ส่งการแจ้งเตือนสำหรับใบงานของผู้อื่น' });
       return;
     }
