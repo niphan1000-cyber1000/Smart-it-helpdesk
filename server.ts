@@ -5,12 +5,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { aiUidLimiter, PORT, PROJECT_ROOT_DIR } from './server/config.ts';
 import { createAiRouter } from './server/routes/aiRoutes.ts';
+import { createAuthRouter } from './server/routes/authRoutes.ts';
 import { createWebhookRouter } from './server/routes/webhookRoutes.ts';
 
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '256kb' }));
 
+  app.use('/api/auth', createAuthRouter());
   app.use('/api/ai', createAiRouter());
   app.use('/api/webhook', createWebhookRouter());
 

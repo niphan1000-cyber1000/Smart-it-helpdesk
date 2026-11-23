@@ -6,6 +6,7 @@ interface HeaderProps {
   activeMode: AppViewMode;
   onModeChange: (mode: AppViewMode) => void;
   user: User | null;
+  isAdmin: boolean;
   onSignIn: () => void;
   onSignOut: () => void;
 }
@@ -14,6 +15,7 @@ export function Header({
   activeMode,
   onModeChange,
   user,
+  isAdmin,
   onSignIn,
   onSignOut,
 }: HeaderProps) {
@@ -48,20 +50,22 @@ export function Header({
             <span className="md:hidden">ผู้แจ้งซ่อม</span>
           </button>
 
-          <button
-            type="button"
-            onClick={() => onModeChange('admin')}
-            aria-pressed={activeMode === 'admin'}
-            className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs sm:text-sm font-medium rounded-md transition-all duration-150 whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 ${
-              activeMode === 'admin'
-                ? 'bg-white text-slate-900 shadow-xs'
-                : 'text-slate-600 hover:text-slate-900'
-            }`}
-          >
-            <ShieldCheck className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-            <span className="hidden md:inline">หน้าสำหรับเจ้าหน้าที่ไอที (IT Admin)</span>
-            <span className="md:hidden">เจ้าหน้าที่ไอที</span>
-          </button>
+          {user && isAdmin && (
+            <button
+              type="button"
+              onClick={() => onModeChange('admin')}
+              aria-pressed={activeMode === 'admin'}
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs sm:text-sm font-medium rounded-md transition-all duration-150 whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 ${
+                activeMode === 'admin'
+                  ? 'bg-white text-slate-900 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              <ShieldCheck className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+              <span className="hidden md:inline">หน้าสำหรับเจ้าหน้าที่ไอที (IT Admin)</span>
+              <span className="md:hidden">เจ้าหน้าที่ไอที</span>
+            </button>
+          )}
         </nav>
 
         {/* Zone 3: Single Primary Account Action */}

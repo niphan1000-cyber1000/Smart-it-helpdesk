@@ -11,6 +11,7 @@ import {
   LayoutGrid,
   Loader2,
   Package,
+  RefreshCw,
   Search,
   ShieldAlert,
   Table2,
@@ -48,6 +49,8 @@ interface AdminDashboardProps {
   onExportCsv: (filteredTickets: RepairTicket[]) => void;
   onSeedDemoData: () => Promise<void>;
   onSwitchToUser: () => void;
+  onRefreshAccess?: () => Promise<void>;
+  refreshingAccess?: boolean;
 }
 
 type AdminViewLayout = 'table' | 'board' | 'audit';
@@ -66,6 +69,8 @@ export function AdminDashboard({
   onExportCsv,
   onSeedDemoData,
   onSwitchToUser,
+  onRefreshAccess,
+  refreshingAccess = false,
 }: AdminDashboardProps) {
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<'ทั้งหมด' | TicketStatus>(
@@ -148,15 +153,33 @@ export function AdminDashboard({
             มุมมองนี้สงวนสิทธิ์เฉพาะเจ้าหน้าที่ไอที (IT Admin)
           </h1>
           <p className="text-sm text-slate-600 leading-relaxed">
-            บัญชีปัจจุบันของคุณ ({user.email}) มีสิทธิ์ใช้งานในส่วนผู้แจ้งซ่อม (User Portal) สำหรับส่งใบแจ้งซ่อมและติดตามสถานะงานของตนเอง
+            บัญชีปัจจุบันของคุณ ({user.email}) ยังไม่ได้รับสิทธิ์เจ้าหน้าที่ไอที (Custom Claim{' '}
+            <code className="text-xs bg-slate-100 px-1.5 py-0.5 rounded">admin: true</code>{' '}
+            หรือรายชื่อในระบบ) จึงใช้งานได้เฉพาะส่วนผู้แจ้งซ่อม (User Portal)
           </p>
-          <button
-            type="button"
-            onClick={onSwitchToUser}
-            className="inline-flex items-center px-5 py-2.5 text-sm font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-lg transition-colors"
-          >
-            กลับไปหน้าสำหรับผู้แจ้งซ่อม (User)
-          </button>
+          <div className="flex flex-wrap items-center justify-center gap-3">
+            {onRefreshAccess && (
+              <button
+                type="button"
+                onClick={() => void onRefreshAccess()}
+                disabled={refreshingAccess}
+                className="inline-flex items-center gap-1.5 px-4 py-2.5 text-sm font-medium text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 disabled:opacity-60 rounded-lg transition-colors"
+              >
+                <RefreshCw
+                  className={`w-4 h-4 ${refreshingAccess ? 'animate-spin' : ''}`}
+                  aria-hidden="true"
+                />
+                <span>ตรวจสอบสิทธิ์ Custom Claim ใหม่</span>
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={onSwitchToUser}
+              className="inline-flex items-center px-5 py-2.5 text-sm font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-lg transition-colors"
+            >
+              กลับไปหน้าสำหรับผู้แจ้งซ่อม (User)
+            </button>
+          </div>
         </div>
       </div>
     );

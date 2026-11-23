@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { onAuthStateChanged, User } from 'firebase/auth';
+import { onIdTokenChanged, User } from 'firebase/auth';
 import {
   BellRing,
   CheckCircle2,
@@ -58,19 +58,26 @@ export default function App() {
 
   const [authError, setAuthError] = useState<string | null>(null);
   const [signingIn, setSigningIn] = useState(false);
+  const [refreshingAccess, setRefreshingAccess] = useState(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+
+  const isAdmin = hasPermission(permissions, 'ticket:read_all');
 
   const showToast = useCallback((message: string) => {
     setToastMessage(message);
   }, []);
 
-  // Firebase Auth listener + standardized RBAC resolution
+  // Firebase ID Token listener (reacts to Custom Claims admin: true updates + API session check)
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, async (nextUser) => {
+    const unsubscribe = onIdTokenChanged(auth, async (nextUser) => {
       setUser(nextUser);
       if (nextUser) {
         const access = await resolveUserAccess(nextUser);
         setPermissions(access.permissions);
+        const adminAllowed = hasPermission(access.permissions, 'ticket:read_all');
+        if (!adminAllowed) {
+          setActiveMode('user');
+        }
         if (hasPermission(access.permissions, 'webhook:manage')) {
           fetchWebhookStatus(nextUser)
             .then((res) => setWebhookConfigured(res.configured))
@@ -80,15 +87,44 @@ export default function App() {
         }
       } else {
         setPermissions(getPermissionsForRole('employee'));
+        setActiveMode('user');
         setTickets([]);
         setAuditLogs([]);
         setAiSelfResolvedCount(0);
+        setWebhookConfigured(false);
         setTicketsLoading(false);
       }
       setAuthReady(true);
     });
     return () => unsubscribe();
   }, []);
+
+  const handleRefreshAccess = useCallback(async () => {
+    if (!user) return;
+    setRefreshingAccess(true);
+    try {
+      const access = await resolveUserAccess(user, true);
+      setPermissions(access.permissions);
+      const adminAllowed = hasPermission(access.permissions, 'ticket:read_all');
+      if (adminAllowed) {
+        if (hasPermission(access.permissions, 'webhook:manage')) {
+          fetchWebhookStatus(user)
+            .then((res) => setWebhookConfigured(res.configured))
+            .catch(() => {});
+        }
+        showToast(
+          access.hasAdminClaim
+            ? 'ยืนยันสิทธิ์เจ้าหน้าที่ไอที (Custom Claim: admin) เรียบร้อยแล้ว'
+            : 'ยืนยันสิทธิ์เจ้าหน้าที่ไอทีเรียบร้อยแล้ว'
+        );
+      } else {
+        setActiveMode('user');
+        showToast('ยังไม่พบสิทธิ์เจ้าหน้าที่ไอทีในโทเค็นปัจจุบัน');
+      }
+    } finally {
+      setRefreshingAccess(false);
+    }
+  }, [user, showToast]);
 
   // Real-time Firestore listeners (unified RBAC permissions)
   useEffect(() => {
@@ -225,8 +261,12 @@ export default function App() {
       <div className="min-h-screen flex flex-col bg-slate-50 text-slate-900">
         <Header
           activeMode={activeMode}
-          onModeChange={setActiveMode}
+          onModeChange={(mode) => {
+            if (mode === 'admin' && !isAdmin) return;
+            setActiveMode(mode);
+          }}
           user={user}
+          isAdmin={isAdmin}
           onSignIn={() => void handleSignIn()}
           onSignOut={() => void handleSignOut()}
         />
@@ -291,7 +331,7 @@ export default function App() {
                 </button>
               </div>
             </div>
-          ) : activeMode === 'user' ? (
+          ) : activeMode === 'user' || !isAdmin ? (
             <UserPortal
               user={user}
               tickets={tickets}
@@ -316,6 +356,8 @@ export default function App() {
               onExportCsv={handleExportCsv}
               onSeedDemoData={handleSeedDemoData}
               onSwitchToUser={() => setActiveMode('user')}
+              onRefreshAccess={handleRefreshAccess}
+              refreshingAccess={refreshingAccess}
             />
           )}
         </main>

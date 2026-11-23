@@ -23,6 +23,7 @@ import {
 } from '../server/services/ai.ts';
 import { getWebhookStatusInfo } from '../server/services/webhook.ts';
 import { createAiRouter } from '../server/routes/aiRoutes.ts';
+import { buildAuthSessionPayload, createAuthRouter } from '../server/routes/authRoutes.ts';
 import { createWebhookRouter } from '../server/routes/webhookRoutes.ts';
 import { hasAdminAccessClaimOrEnv } from '../server/auth.ts';
 
@@ -540,5 +541,32 @@ describe('Modular Backend Services & Routers', () => {
       ),
       false
     );
+  });
+
+  it('builds /api/auth/session payload from verified admin Custom Claim (admin: true)', async () => {
+    const authRouter = createAuthRouter();
+    assert.equal(typeof authRouter, 'function');
+
+    const adminSession = await buildAuthSessionPayload({
+      uid: 'tech-uid-1',
+      email: 'tech@corp.local',
+      emailVerified: true,
+      isAdminClaim: true,
+      idToken: 'mock-token',
+    });
+    assert.equal(adminSession.isAdmin, true);
+    assert.equal(adminSession.role, 'admin');
+    assert.equal(adminSession.claims.admin, true);
+    assert.equal(adminSession.authSource, 'custom_claim');
+
+    const unverifiedSession = await buildAuthSessionPayload({
+      uid: 'tech-uid-2',
+      email: 'unverified@corp.local',
+      emailVerified: false,
+      isAdminClaim: true,
+      idToken: 'mock-token',
+    });
+    assert.equal(unverifiedSession.isAdmin, false);
+    assert.equal(unverifiedSession.role, 'employee');
   });
 });

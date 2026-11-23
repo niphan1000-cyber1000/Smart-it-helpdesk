@@ -90,39 +90,111 @@ function makeAuditId(): string {
   return `aud-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+export type AdminAuthSource =
+  | 'custom_claim'
+  | 'allowlist_or_db'
+  | 'env'
+  | 'admins_doc'
+  | 'standard';
+
 export interface UserAccessProfile {
   role: UserRole;
   permissions: Permission[];
+  hasAdminClaim: boolean;
+  authSource: AdminAuthSource;
 }
 
-export async function resolveUserAccess(user: User): Promise<UserAccessProfile> {
+export async function resolveUserAccess(
+  user: User,
+  forceRefresh = false
+): Promise<UserAccessProfile> {
   if (!user.emailVerified) {
-    return { role: 'employee', permissions: getPermissionsForRole('employee') };
+    return {
+      role: 'employee',
+      permissions: getPermissionsForRole('employee'),
+      hasAdminClaim: false,
+      authSource: 'standard',
+    };
   }
 
+  let hasAdminClaim = false;
+  let idToken = '';
   try {
-    const tokenResult = await user.getIdTokenResult();
-    if (tokenResult.claims.admin === true) {
-      return { role: 'admin', permissions: getPermissionsForRole('admin') };
-    }
+    const tokenResult = await user.getIdTokenResult(forceRefresh);
+    hasAdminClaim = tokenResult.claims.admin === true;
+    idToken = tokenResult.token;
   } catch {
-    // Fallback to environment list or Firestore lookup
+    // Fallback to environment list, backend session, or Firestore lookup
+  }
+
+  if (hasAdminClaim) {
+    return {
+      role: 'admin',
+      permissions: getPermissionsForRole('admin'),
+      hasAdminClaim: true,
+      authSource: 'custom_claim',
+    };
+  }
+
+  if (idToken) {
+    try {
+      const res = await fetch('/api/auth/session', {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${idToken}`,
+        },
+        signal: AbortSignal.timeout(4000),
+      });
+      if (res.ok) {
+        const session = (await res.json()) as {
+          isAdmin?: boolean;
+          claims?: { admin?: boolean };
+          authSource?: AdminAuthSource;
+        };
+        const claimAdmin = Boolean(session.claims?.admin);
+        if (claimAdmin || session.isAdmin) {
+          return {
+            role: 'admin',
+            permissions: getPermissionsForRole('admin'),
+            hasAdminClaim: claimAdmin,
+            authSource: claimAdmin ? 'custom_claim' : session.authSource || 'allowlist_or_db',
+          };
+        }
+      }
+    } catch {
+      // Fallback gracefully to client env / Firestore lookup if API is unreachable
+    }
   }
 
   if (user.email && ENV_ADMIN_EMAILS.includes(user.email.toLowerCase())) {
-    return { role: 'admin', permissions: getPermissionsForRole('admin') };
+    return {
+      role: 'admin',
+      permissions: getPermissionsForRole('admin'),
+      hasAdminClaim: false,
+      authSource: 'env',
+    };
   }
 
   try {
     const adminSnap = await getDoc(doc(db, 'admins', user.uid));
     if (adminSnap.exists()) {
-      return { role: 'admin', permissions: getPermissionsForRole('admin') };
+      return {
+        role: 'admin',
+        permissions: getPermissionsForRole('admin'),
+        hasAdminClaim: false,
+        authSource: 'admins_doc',
+      };
     }
   } catch {
     // Non-admin users receive permission-denied or not-found gracefully
   }
 
-  return { role: 'employee', permissions: getPermissionsForRole('employee') };
+  return {
+    role: 'employee',
+    permissions: getPermissionsForRole('employee'),
+    hasAdminClaim: false,
+    authSource: 'standard',
+  };
 }
 
 export function subscribeToTickets(

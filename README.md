@@ -1,6 +1,6 @@
 # ศูนย์บริการแจ้งซ่อมไอที (IT Helpdesk & Repair Ticketing)
 
-[![Enterprise CI](https://github.com/niphan1000-cyber1000/Smart-it-helpdesk/actions/workflows/ci.yml/badge.svg)](https://github.com/niphan1000-cyber1000/Smart-it-helpdesk/actions/workflows/ci.yml)
+[![CI](https://github.com/niphan1000-cyber1000/Smart-it-helpdesk/actions/workflows/ci.yml/badge.svg)](https://github.com/niphan1000-cyber1000/Smart-it-helpdesk/actions/workflows/ci.yml)
 
 เว็บแอปพลิเคชันระบบแจ้งซ่อมคอมพิวเตอร์และอุปกรณ์ไอทีสำหรับองค์กร รองรับภาษาไทย 100% พร้อมระบบผู้ช่วย AI วิเคราะห์อาการเสีย ฐานข้อมูล Real-time และแจ้งเตือนผ่าน Webhook
 
