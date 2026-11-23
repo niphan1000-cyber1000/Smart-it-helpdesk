@@ -8,13 +8,39 @@ export interface RateLimitResult {
   allowed: boolean;
   remaining: number;
   retryAfterSeconds: number;
+  degraded?: boolean;
+  unavailable?: boolean;
 }
 
 export type RateLimiterBackend = 'redis-tcp' | 'redis-rest' | 'memory';
+export type RateLimitFailurePolicy = 'fail-closed' | 'fallback-memory';
+
+export interface RateLimiterStats {
+  backend: RateLimiterBackend;
+  failurePolicy: RateLimitFailurePolicy;
+  failureCount: number;
+  lastErrorAt: string | null;
+}
 
 export interface AsyncRateLimiter {
   readonly backend: RateLimiterBackend;
+  readonly failurePolicy: RateLimitFailurePolicy;
   check(key: string, nowMs?: number): Promise<RateLimitResult>;
+  getStats(): RateLimiterStats;
+}
+
+export function resolveRateLimitFailurePolicy(options: {
+  configuredPolicy?: string;
+  nodeEnv?: string;
+  hasRedisBackend: boolean;
+}): RateLimitFailurePolicy {
+  const normalized = options.configuredPolicy?.trim().toLowerCase();
+  if (normalized === 'fail-closed') return 'fail-closed';
+  if (normalized === 'fallback-memory') return 'fallback-memory';
+  if (options.nodeEnv?.trim().toLowerCase() === 'production' && options.hasRedisBackend) {
+    return 'fail-closed';
+  }
+  return 'fallback-memory';
 }
 
 export class SlidingWindowRateLimiter {
@@ -147,14 +173,65 @@ function parseRedisTupleResult(raw: unknown): RateLimitResult {
   };
 }
 
+function handleBackendFailure(params: {
+  backend: RateLimiterBackend;
+  failurePolicy: RateLimitFailurePolicy;
+  keyPrefix: string;
+  failureCount: number;
+  err: unknown;
+  fallback: SlidingWindowRateLimiter;
+  key: string;
+  nowMs: number;
+  onFailureLog?: (payload: Record<string, unknown>) => void;
+}): RateLimitResult {
+  const errMsg = params.err instanceof Error ? params.err.message : String(params.err);
+  const logPayload = {
+    level: 'error',
+    event: 'rate_limiter.redis_failure',
+    backend: params.backend,
+    failurePolicy: params.failurePolicy,
+    keyPrefix: params.keyPrefix,
+    failureCount: params.failureCount,
+    error: errMsg,
+    timestamp: new Date(params.nowMs).toISOString(),
+  };
+
+  if (params.onFailureLog) {
+    params.onFailureLog(logPayload);
+  } else {
+    console.error(JSON.stringify(logPayload));
+  }
+
+  if (params.failurePolicy === 'fail-closed') {
+    return {
+      allowed: false,
+      remaining: 0,
+      retryAfterSeconds: 30,
+      degraded: true,
+      unavailable: true,
+    };
+  }
+
+  const localRes = params.fallback.check(params.key, params.nowMs);
+  return {
+    ...localRes,
+    degraded: true,
+    unavailable: false,
+  };
+}
+
 export class RedisTcpRateLimiter implements AsyncRateLimiter {
   readonly backend: RateLimiterBackend = 'redis-tcp';
+  readonly failurePolicy: RateLimitFailurePolicy;
   private readonly redisUrl: URL;
   private readonly maxRequests: number;
   private readonly windowMs: number;
   private readonly keyPrefix: string;
   private readonly fallback: SlidingWindowRateLimiter;
   private readonly timeoutMs: number;
+  private readonly onFailureLog?: (payload: Record<string, unknown>) => void;
+  private failureCount = 0;
+  private lastErrorAt: string | null = null;
 
   constructor(options: {
     redisUrl: string;
@@ -162,13 +239,26 @@ export class RedisTcpRateLimiter implements AsyncRateLimiter {
     windowMs: number;
     keyPrefix?: string;
     timeoutMs?: number;
+    failurePolicy?: RateLimitFailurePolicy;
+    onFailureLog?: (payload: Record<string, unknown>) => void;
   }) {
     this.redisUrl = new URL(options.redisUrl);
     this.maxRequests = options.maxRequests;
     this.windowMs = options.windowMs;
     this.keyPrefix = options.keyPrefix ?? 'rl:';
     this.timeoutMs = options.timeoutMs ?? 1500;
+    this.failurePolicy = options.failurePolicy ?? 'fallback-memory';
+    this.onFailureLog = options.onFailureLog;
     this.fallback = new SlidingWindowRateLimiter(options.maxRequests, options.windowMs);
+  }
+
+  getStats(): RateLimiterStats {
+    return {
+      backend: this.backend,
+      failurePolicy: this.failurePolicy,
+      failureCount: this.failureCount,
+      lastErrorAt: this.lastErrorAt,
+    };
   }
 
   private async execLuaSlidingWindow(key: string, nowMs: number): Promise<RateLimitResult> {
@@ -275,20 +365,36 @@ export class RedisTcpRateLimiter implements AsyncRateLimiter {
   async check(key: string, nowMs = Date.now()): Promise<RateLimitResult> {
     try {
       return await this.execLuaSlidingWindow(key, nowMs);
-    } catch {
-      return this.fallback.check(key, nowMs);
+    } catch (err) {
+      this.failureCount += 1;
+      this.lastErrorAt = new Date(nowMs).toISOString();
+      return handleBackendFailure({
+        backend: this.backend,
+        failurePolicy: this.failurePolicy,
+        keyPrefix: this.keyPrefix,
+        failureCount: this.failureCount,
+        err,
+        fallback: this.fallback,
+        key,
+        nowMs,
+        onFailureLog: this.onFailureLog,
+      });
     }
   }
 }
 
 export class RedisRestRateLimiter implements AsyncRateLimiter {
   readonly backend: RateLimiterBackend = 'redis-rest';
+  readonly failurePolicy: RateLimitFailurePolicy;
   private readonly restUrl: string;
   private readonly restToken: string;
   private readonly maxRequests: number;
   private readonly windowMs: number;
   private readonly keyPrefix: string;
   private readonly fallback: SlidingWindowRateLimiter;
+  private readonly onFailureLog?: (payload: Record<string, unknown>) => void;
+  private failureCount = 0;
+  private lastErrorAt: string | null = null;
 
   constructor(options: {
     restUrl: string;
@@ -296,13 +402,26 @@ export class RedisRestRateLimiter implements AsyncRateLimiter {
     maxRequests: number;
     windowMs: number;
     keyPrefix?: string;
+    failurePolicy?: RateLimitFailurePolicy;
+    onFailureLog?: (payload: Record<string, unknown>) => void;
   }) {
     this.restUrl = options.restUrl.replace(/\/+$/, '');
     this.restToken = options.restToken;
     this.maxRequests = options.maxRequests;
     this.windowMs = options.windowMs;
     this.keyPrefix = options.keyPrefix ?? 'rl:';
+    this.failurePolicy = options.failurePolicy ?? 'fallback-memory';
+    this.onFailureLog = options.onFailureLog;
     this.fallback = new SlidingWindowRateLimiter(options.maxRequests, options.windowMs);
+  }
+
+  getStats(): RateLimiterStats {
+    return {
+      backend: this.backend,
+      failurePolicy: this.failurePolicy,
+      failureCount: this.failureCount,
+      lastErrorAt: this.lastErrorAt,
+    };
   }
 
   async check(key: string, nowMs = Date.now()): Promise<RateLimitResult> {
@@ -336,18 +455,40 @@ export class RedisRestRateLimiter implements AsyncRateLimiter {
         throw new Error(json.error);
       }
       return parseRedisTupleResult(json.result);
-    } catch {
-      return this.fallback.check(key, nowMs);
+    } catch (err) {
+      this.failureCount += 1;
+      this.lastErrorAt = new Date(nowMs).toISOString();
+      return handleBackendFailure({
+        backend: this.backend,
+        failurePolicy: this.failurePolicy,
+        keyPrefix: this.keyPrefix,
+        failureCount: this.failureCount,
+        err,
+        fallback: this.fallback,
+        key,
+        nowMs,
+        onFailureLog: this.onFailureLog,
+      });
     }
   }
 }
 
 export class MemoryAsyncRateLimiter implements AsyncRateLimiter {
   readonly backend: RateLimiterBackend = 'memory';
+  readonly failurePolicy: RateLimitFailurePolicy = 'fallback-memory';
   private readonly limiter: SlidingWindowRateLimiter;
 
   constructor(maxRequests: number, windowMs: number) {
     this.limiter = new SlidingWindowRateLimiter(maxRequests, windowMs);
+  }
+
+  getStats(): RateLimiterStats {
+    return {
+      backend: this.backend,
+      failurePolicy: this.failurePolicy,
+      failureCount: 0,
+      lastErrorAt: null,
+    };
   }
 
   async check(key: string, nowMs = Date.now()): Promise<RateLimitResult> {
@@ -362,26 +503,44 @@ export function createRateLimiter(options: {
   redisUrl?: string;
   redisRestUrl?: string;
   redisRestToken?: string;
+  failurePolicy?: string;
+  nodeEnv?: string;
+  onFailureLog?: (payload: Record<string, unknown>) => void;
 }): AsyncRateLimiter {
   const redisUrl = options.redisUrl?.trim();
-  if (redisUrl && (redisUrl.startsWith('redis://') || redisUrl.startsWith('rediss://'))) {
+  const restUrl = options.redisRestUrl?.trim();
+  const restToken = options.redisRestToken?.trim();
+  const hasTcp = Boolean(
+    redisUrl && (redisUrl.startsWith('redis://') || redisUrl.startsWith('rediss://'))
+  );
+  const hasRest = Boolean(restUrl && restToken && restUrl.startsWith('https://'));
+
+  const failurePolicy = resolveRateLimitFailurePolicy({
+    configuredPolicy: options.failurePolicy,
+    nodeEnv: options.nodeEnv,
+    hasRedisBackend: hasTcp || hasRest,
+  });
+
+  if (hasTcp && redisUrl) {
     return new RedisTcpRateLimiter({
       redisUrl,
       maxRequests: options.maxRequests,
       windowMs: options.windowMs,
       keyPrefix: options.keyPrefix,
+      failurePolicy,
+      onFailureLog: options.onFailureLog,
     });
   }
 
-  const restUrl = options.redisRestUrl?.trim();
-  const restToken = options.redisRestToken?.trim();
-  if (restUrl && restToken && restUrl.startsWith('https://')) {
+  if (hasRest && restUrl && restToken) {
     return new RedisRestRateLimiter({
       restUrl,
       restToken,
       maxRequests: options.maxRequests,
       windowMs: options.windowMs,
       keyPrefix: options.keyPrefix,
+      failurePolicy,
+      onFailureLog: options.onFailureLog,
     });
   }
 

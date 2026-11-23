@@ -9,6 +9,7 @@ import {
   postJsonWithPinnedIp,
   RedisRestRateLimiter,
   RedisTcpRateLimiter,
+  resolveRateLimitFailurePolicy,
   SlidingWindowRateLimiter,
   validateWebhookUrlStructure,
 } from '../server/security.ts';
@@ -316,24 +317,82 @@ describe('Distributed Shared Rate Limiter (F-13)', () => {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
 
-    // Graceful fallback to in-memory limiter if Redis server becomes unreachable
+    const loggedFailures: Array<Record<string, unknown>> = [];
+
+    // Graceful fallback-memory policy logs structured error + tracks failureCount
     const fallbackLimiter = new RedisTcpRateLimiter({
       redisUrl: `redis://127.0.0.1:${addr.port}`,
       maxRequests: 1,
       windowMs: 60_000,
       timeoutMs: 300,
+      failurePolicy: 'fallback-memory',
+      onFailureLog: (entry) => loggedFailures.push(entry),
     });
     const fb1 = await fallbackLimiter.check('user-fb', 2_000_000);
     const fb2 = await fallbackLimiter.check('user-fb', 2_000_100);
     assert.equal(fb1.allowed, true);
+    assert.equal(fb1.degraded, true);
+    assert.equal(fb1.unavailable, false);
     assert.equal(fb2.allowed, false);
+    assert.equal(fallbackLimiter.getStats().failureCount, 2);
+    assert.equal(loggedFailures.length, 2);
+    assert.equal(loggedFailures[0].event, 'rate_limiter.redis_failure');
+    assert.equal(loggedFailures[0].failurePolicy, 'fallback-memory');
+
+    // Explicit fail-closed policy blocks requests with unavailable: true on Redis outage
+    const closedLogs: Array<Record<string, unknown>> = [];
+    const failClosedLimiter = new RedisTcpRateLimiter({
+      redisUrl: `redis://127.0.0.1:${addr.port}`,
+      maxRequests: 5,
+      windowMs: 60_000,
+      timeoutMs: 300,
+      failurePolicy: 'fail-closed',
+      onFailureLog: (entry) => closedLogs.push(entry),
+    });
+    const fc1 = await failClosedLimiter.check('user-fc', 3_000_000);
+    assert.equal(fc1.allowed, false);
+    assert.equal(fc1.degraded, true);
+    assert.equal(fc1.unavailable, true);
+    assert.equal(fc1.retryAfterSeconds, 30);
+    assert.equal(failClosedLimiter.getStats().failureCount, 1);
+    assert.equal(closedLogs[0].failurePolicy, 'fail-closed');
   });
 
-  it('supports Upstash-compatible Redis REST EVAL responses', async () => {
+  it('resolves RATE_LIMIT_FAILURE_POLICY defaults cleanly for production vs preview', () => {
+    assert.equal(
+      resolveRateLimitFailurePolicy({ nodeEnv: 'production', hasRedisBackend: true }),
+      'fail-closed'
+    );
+    assert.equal(
+      resolveRateLimitFailurePolicy({ nodeEnv: 'development', hasRedisBackend: true }),
+      'fallback-memory'
+    );
+    assert.equal(
+      resolveRateLimitFailurePolicy({
+        configuredPolicy: 'fallback-memory',
+        nodeEnv: 'production',
+        hasRedisBackend: true,
+      }),
+      'fallback-memory'
+    );
+    assert.equal(
+      resolveRateLimitFailurePolicy({
+        configuredPolicy: 'fail-closed',
+        nodeEnv: 'development',
+        hasRedisBackend: true,
+      }),
+      'fail-closed'
+    );
+  });
+
+  it('supports Upstash-compatible Redis REST EVAL responses and fail-closed on REST error', async () => {
     const originalFetch = globalThis.fetch;
     let callNum = 0;
     globalThis.fetch = (async () => {
       callNum += 1;
+      if (callNum === 3) {
+        return new Response('Upstream error', { status: 502 });
+      }
       const result = callNum === 1 ? [1, 4, 0] : [0, 0, 15];
       return new Response(JSON.stringify({ result }), {
         status: 200,
@@ -342,11 +401,14 @@ describe('Distributed Shared Rate Limiter (F-13)', () => {
     }) as typeof fetch;
 
     try {
+      const restLogs: Array<Record<string, unknown>> = [];
       const limiter = new RedisRestRateLimiter({
         restUrl: 'https://redis-rest.example.com',
         restToken: 'secret-token',
         maxRequests: 5,
         windowMs: 60_000,
+        failurePolicy: 'fail-closed',
+        onFailureLog: (entry) => restLogs.push(entry),
       });
 
       const first = await limiter.check('rest-user', 1000);
@@ -356,8 +418,56 @@ describe('Distributed Shared Rate Limiter (F-13)', () => {
       const second = await limiter.check('rest-user', 2000);
       assert.equal(second.allowed, false);
       assert.equal(second.retryAfterSeconds, 15);
+
+      const third = await limiter.check('rest-user', 3000);
+      assert.equal(third.allowed, false);
+      assert.equal(third.unavailable, true);
+      assert.equal(limiter.getStats().failureCount, 1);
+      assert.equal(restLogs.length, 1);
     } finally {
       globalThis.fetch = originalFetch;
     }
   });
 });
+
+// Live Redis 7 Integration Suite (runs automatically in CI via REDIS_URL service container)
+const liveRedisUrl = process.env.REDIS_URL?.trim();
+if (liveRedisUrl) {
+  describe('Live Redis 7 Multi-Instance Rate Limiter Integration (F-13)', () => {
+    it('enforces shared atomic Lua sliding window across two independent server instances', async () => {
+      const runPrefix = `ci:rl:${Date.now()}:${Math.random().toString(36).slice(2, 8)}:`;
+      const instanceA = new RedisTcpRateLimiter({
+        redisUrl: liveRedisUrl,
+        maxRequests: 3,
+        windowMs: 60_000,
+        keyPrefix: runPrefix,
+        failurePolicy: 'fail-closed',
+      });
+      const instanceB = new RedisTcpRateLimiter({
+        redisUrl: liveRedisUrl,
+        maxRequests: 3,
+        windowMs: 60_000,
+        keyPrefix: runPrefix,
+        failurePolicy: 'fail-closed',
+      });
+
+      const now = Date.now();
+      const r1 = await instanceA.check('shared-emp', now);
+      const r2 = await instanceB.check('shared-emp', now + 10);
+      const r3 = await instanceA.check('shared-emp', now + 20);
+      const r4 = await instanceB.check('shared-emp', now + 30);
+
+      assert.equal(r1.allowed, true);
+      assert.equal(r1.remaining, 2);
+      assert.equal(r2.allowed, true);
+      assert.equal(r2.remaining, 1);
+      assert.equal(r3.allowed, true);
+      assert.equal(r3.remaining, 0);
+      assert.equal(r4.allowed, false);
+      assert.equal(r4.unavailable, undefined);
+      assert.ok(r4.retryAfterSeconds >= 1);
+      assert.equal(instanceA.getStats().failureCount, 0);
+      assert.equal(instanceB.getStats().failureCount, 0);
+    });
+  });
+}

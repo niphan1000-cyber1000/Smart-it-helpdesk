@@ -9,6 +9,16 @@ on:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -30,7 +40,9 @@ jobs:
       - name: Lint Firestore security rules
         run: bun run lint:rules
 
-      - name: Run automated security and RBAC tests
+      - name: Run automated security, RBAC, and real Redis tests
+        env:
+          REDIS_URL: redis://127.0.0.1:6379/0
         run: bun run test
 
       - name: Build production bundle

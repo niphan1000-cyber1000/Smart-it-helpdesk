@@ -86,6 +86,8 @@ const redisLimiterEnv = {
   redisUrl: process.env.REDIS_URL,
   redisRestUrl: process.env.REDIS_REST_URL,
   redisRestToken: process.env.REDIS_REST_TOKEN,
+  failurePolicy: process.env.RATE_LIMIT_FAILURE_POLICY,
+  nodeEnv: process.env.NODE_ENV,
 };
 const aiUidLimiter = createRateLimiter({
   maxRequests: 15,
@@ -422,6 +424,12 @@ async function enforceAiRateLimit(user: VerifiedUser, req: Request, res: Respons
   const uidCheck = await aiUidLimiter.check(user.uid);
   if (!uidCheck.allowed) {
     res.setHeader('Retry-After', String(uidCheck.retryAfterSeconds));
+    if (uidCheck.unavailable) {
+      res.status(503).json({
+        error: `ระบบควบคุมโควตา AI ชั่วคราวไม่สามารถเชื่อมต่อฐานข้อมูลกลางได้ กรุณารอ ${uidCheck.retryAfterSeconds} วินาที`,
+      });
+      return false;
+    }
     res.status(429).json({
       error: `คุณใช้งาน AI เกินโควตาชั่วคราว กรุณารอ ${uidCheck.retryAfterSeconds} วินาทีแล้วลองใหม่`,
     });
@@ -431,6 +439,12 @@ async function enforceAiRateLimit(user: VerifiedUser, req: Request, res: Respons
   const ipCheck = await aiIpLimiter.check(getClientIp(req));
   if (!ipCheck.allowed) {
     res.setHeader('Retry-After', String(ipCheck.retryAfterSeconds));
+    if (ipCheck.unavailable) {
+      res.status(503).json({
+        error: `ระบบควบคุมโควตา AI ชั่วคราวไม่สามารถเชื่อมต่อฐานข้อมูลกลางได้ กรุณารอ ${ipCheck.retryAfterSeconds} วินาที`,
+      });
+      return false;
+    }
     res.status(429).json({
       error: `มีการเรียกใช้งาน AI จากเครือข่ายนี้จำนวนมากเกินไป กรุณารอ ${ipCheck.retryAfterSeconds} วินาที`,
     });
@@ -960,8 +974,10 @@ async function startServer() {
     const rateCheck = await webhookUidLimiter.check(user.uid);
     if (!rateCheck.allowed) {
       res.setHeader('Retry-After', String(rateCheck.retryAfterSeconds));
-      res.status(429).json({
-        error: `ส่งการแจ้งเตือนถี่เกินไป กรุณารอ ${rateCheck.retryAfterSeconds} วินาที`,
+      res.status(rateCheck.unavailable ? 503 : 429).json({
+        error: rateCheck.unavailable
+          ? `ระบบควบคุมการแจ้งเตือนชั่วคราวไม่สามารถเชื่อมต่อฐานข้อมูลกลางได้ กรุณารอ ${rateCheck.retryAfterSeconds} วินาที`
+          : `ส่งการแจ้งเตือนถี่เกินไป กรุณารอ ${rateCheck.retryAfterSeconds} วินาที`,
       });
       return;
     }
@@ -1045,7 +1061,7 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(
-      `IT Helpdesk server running at http://localhost:${PORT} (rateLimiter=${aiUidLimiter.backend})`
+      `IT Helpdesk server running at http://localhost:${PORT} (rateLimiter=${aiUidLimiter.backend}, failurePolicy=${aiUidLimiter.failurePolicy})`
     );
     if (process.env.NODE_ENV === 'production' && aiUidLimiter.backend === 'memory') {
       console.warn(
