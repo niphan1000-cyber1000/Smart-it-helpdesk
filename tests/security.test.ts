@@ -16,6 +16,14 @@ import {
 import { getPermissionsForRole, hasPermission } from '../src/types/ticket.ts';
 import { createInitialMockTickets } from '../src/data/mockTickets.ts';
 import { resolveSeedCounterPlan } from '../src/utils/ticketCounter.ts';
+import {
+  buildFallbackDiagnostic,
+  buildFallbackTroubleshoot,
+  getSafeAiErrorMessage,
+} from '../server/services/ai.ts';
+import { getWebhookStatusInfo } from '../server/services/webhook.ts';
+import { createAiRouter } from '../server/routes/aiRoutes.ts';
+import { createWebhookRouter } from '../server/routes/webhookRoutes.ts';
 
 describe('SlidingWindowRateLimiter', () => {
   it('allows requests up to maxRequests and blocks excess until window expires', () => {
@@ -471,3 +479,34 @@ if (liveRedisUrl) {
     });
   });
 }
+
+describe('Modular Backend Services & Routers', () => {
+  it('provides Thai fallback troubleshoot and diagnostic responses plus safe AI error mapping', () => {
+    const troubleshoot = buildFallbackTroubleshoot('Wi-Fi', 'ต่อเน็ตไม่ได้');
+    assert.ok(troubleshoot.summary.length > 0);
+    assert.ok(troubleshoot.steps.length >= 3);
+
+    const diagnostic = buildFallbackDiagnostic('ปริ้นเตอร์', 'พิมพ์ไม่ออก');
+    assert.ok(diagnostic.rootCause.length > 0);
+    assert.ok(diagnostic.toolsAndParts.length >= 3);
+    assert.ok(diagnostic.technicalSteps.length >= 3);
+
+    const badKey = getSafeAiErrorMessage({ status: 403, message: 'PERMISSION_DENIED' });
+    assert.equal(badKey.status, 403);
+    assert.match(badKey.message, /GEMINI_API_KEY/);
+
+    const quota = getSafeAiErrorMessage({ status: 429, message: 'RESOURCE_EXHAUSTED' });
+    assert.equal(quota.status, 429);
+  });
+
+  it('constructs AI and Webhook Express routers and reports safe masked webhook status', () => {
+    const aiRouter = createAiRouter();
+    const webhookRouter = createWebhookRouter();
+    assert.equal(typeof aiRouter, 'function');
+    assert.equal(typeof webhookRouter, 'function');
+
+    const status = getWebhookStatusInfo();
+    assert.ok(['env', 'runtime', 'none'].includes(status.source));
+    assert.equal(typeof status.configured, 'boolean');
+  });
+});

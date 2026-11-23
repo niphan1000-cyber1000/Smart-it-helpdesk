@@ -244,9 +244,23 @@ if (emulatorHost) {
   }
 
   describe('Firestore Emulator Live Dirty Dozen (All 12 Cases) + F-11 & F-09', () => {
-    it('01_unauthenticated_ticket_read: denies unauthenticated ticket read', async () => {
-      const res = await fetch(`${baseUrl}/tickets/IT-2026-001`);
-      assert.equal(res.status, 403);
+    it('01_unauthenticated_ticket_read: denies unauthenticated ticket read and write', async () => {
+      const readRes = await fetch(`${baseUrl}/tickets/IT-2026-001`);
+      assert.equal(readRes.status, 403);
+
+      const writeRes = await commitWrites(
+        null,
+        buildAtomicTicketCommit(
+          'IT-2026-001',
+          1,
+          'emp-uid-1',
+          'employee1@company.co.th',
+          'aud-01',
+          {},
+          true
+        )
+      );
+      assert.equal(writeRes.status, 403);
     });
 
     it('02_unverified_email_ticket_create: denies unverified email ticket creation', async () => {
