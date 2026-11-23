@@ -113,12 +113,20 @@ service cloud.firestore {
         && (!('aiTroubleshooting' in data) || data.aiTroubleshooting == null || isValidAiTroubleshooting(data.aiTroubleshooting));
     }
 
+    function formatSeq(n) {
+      return n < 10 ? ('00' + string(n)) : (n < 100 ? ('0' + string(n)) : string(n));
+    }
+
     function isValidCounter(data) {
-      return data.keys().hasAll(['lastNumber', 'updatedAt'])
-        && data.keys().hasOnly(['lastNumber', 'updatedAt'])
+      return data.keys().hasAll(['lastNumber', 'lastTicketId', 'updatedAt'])
+        && data.keys().hasOnly(['lastNumber', 'lastTicketId', 'updatedAt'])
         && data.lastNumber is int
         && data.lastNumber >= 1
         && data.lastNumber <= 999999
+        && data.lastTicketId is string
+        && data.lastTicketId.size() >= 3
+        && data.lastTicketId.size() <= 32
+        && data.lastTicketId.matches('^IT-[0-9]{4}-' + formatSeq(data.lastNumber) + '$')
         && data.updatedAt is timestamp;
     }
 
@@ -176,7 +184,12 @@ service cloud.firestore {
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time
         && (incoming().status == 'รอดำเนินการ' || isAdmin())
-        && existsAfter(/databases/$(database)/documents/counters/tickets);
+        && existsAfter(/databases/$(database)/documents/counters/tickets)
+        && getAfter(/databases/$(database)/documents/counters/tickets).data.updatedAt == request.time
+        && (
+          getAfter(/databases/$(database)/documents/counters/tickets).data.lastTicketId == ticketId
+          || isAdmin()
+        );
 
       allow update: if isSignedIn()
         && isValidId(ticketId)
@@ -199,12 +212,35 @@ service cloud.firestore {
         && counterId == 'tickets'
         && isValidCounter(incoming())
         && incoming().updatedAt == request.time
-        && (incoming().lastNumber == 1 || isAdmin());
+        && (
+          (
+            incoming().lastNumber == 1
+            && !exists(/databases/$(database)/documents/tickets/$(incoming().lastTicketId))
+            && existsAfter(/databases/$(database)/documents/tickets/$(incoming().lastTicketId))
+            && getAfter(/databases/$(database)/documents/tickets/$(incoming().lastTicketId)).data.createdByUid == request.auth.uid
+          )
+          || (
+            isAdmin()
+            && existsAfter(/databases/$(database)/documents/tickets/$(incoming().lastTicketId))
+          )
+        );
       allow update: if isSignedIn()
         && counterId == 'tickets'
         && isValidCounter(incoming())
         && incoming().updatedAt == request.time
-        && (incoming().lastNumber == existing().lastNumber + 1 || (isAdmin() && incoming().lastNumber >= existing().lastNumber));
+        && (
+          (
+            incoming().lastNumber == existing().lastNumber + 1
+            && !exists(/databases/$(database)/documents/tickets/$(incoming().lastTicketId))
+            && existsAfter(/databases/$(database)/documents/tickets/$(incoming().lastTicketId))
+            && getAfter(/databases/$(database)/documents/tickets/$(incoming().lastTicketId)).data.createdByUid == request.auth.uid
+          )
+          || (
+            isAdmin()
+            && incoming().lastNumber >= existing().lastNumber
+            && existsAfter(/databases/$(database)/documents/tickets/$(incoming().lastTicketId))
+          )
+        );
       allow delete: if false;
     }
 

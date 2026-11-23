@@ -33,6 +33,26 @@ describe('Firestore Rules Dirty Dozen & Security Invariants', () => {
     );
   });
 
+  it('F-11: enforces bidirectional atomic coupling between /counters/tickets and /tickets/{ticketId}', () => {
+    assert.match(rulesSource, /function formatSeq\(n\)/);
+    assert.match(
+      rulesSource,
+      /data\.lastTicketId\.matches\('\^IT-\[0-9\]\{4\}-' \+ formatSeq\(data\.lastNumber\) \+ '\$'\)/
+    );
+    assert.match(
+      rulesSource,
+      /getAfter\(\/databases\/\$\(database\)\/documents\/counters\/tickets\)\.data\.updatedAt == request\.time/
+    );
+    assert.match(
+      rulesSource,
+      /getAfter\(\/databases\/\$\(database\)\/documents\/counters\/tickets\)\.data\.lastTicketId == ticketId/
+    );
+    assert.match(
+      rulesSource,
+      /match \/counters\/\{counterId\}[\s\S]*?!exists\(\/databases\/\$\(database\)\/documents\/tickets\/\$\(incoming\(\)\.lastTicketId\)\)[\s\S]*?existsAfter\(\/databases\/\$\(database\)\/documents\/tickets\/\$\(incoming\(\)\.lastTicketId\)\)/
+    );
+  });
+
   it('protects /tickets read/list/create/update/delete against spoofing, blanket list, and privilege escalation', () => {
     assert.match(
       rulesSource,
@@ -47,10 +67,6 @@ describe('Firestore Rules Dirty Dozen & Security Invariants', () => {
     assert.match(rulesSource, /incoming\(\)\.createdAt == request\.time/);
     assert.match(rulesSource, /incoming\(\)\.updatedAt == request\.time/);
     assert.match(rulesSource, /\(incoming\(\)\.status == 'รอดำเนินการ' \|\| isAdmin\(\)\)/);
-    assert.match(
-      rulesSource,
-      /existsAfter\(\/databases\/\$\(database\)\/documents\/counters\/tickets\)/
-    );
     assert.match(
       rulesSource,
       /allow update:\s*if isSignedIn\(\)[\s\S]*?isAdmin\(\)[\s\S]*?incoming\(\)\.createdByUid == existing\(\)\.createdByUid[\s\S]*?incoming\(\)\.createdAt == existing\(\)\.createdAt/
@@ -84,20 +100,14 @@ describe('Firestore Rules Dirty Dozen & Security Invariants', () => {
       /match \/auditLogs\/\{logId\}[\s\S]*?allow list:\s*if isAdmin\(\);[\s\S]*?incoming\(\)\.action in \['admin\.demo_seeded', 'webhook\.config_updated'\]\s*&&\s*isAdmin\(\)[\s\S]*?incoming\(\)\.action == 'ticket\.deleted'\s*&&\s*isAdmin\(\)[\s\S]*?incoming\(\)\.action == 'ticket\.created'[\s\S]*?existsAfter\(\/databases\/\$\(database\)\/documents\/tickets\/\$\(incoming\(\)\.targetId\)\)[\s\S]*?allow update, delete:\s*if false;/
     );
   });
-
-  it('enforces monotonic atomic increments on /counters/tickets and blocks deletes', () => {
-    assert.match(
-      rulesSource,
-      /match \/counters\/\{counterId\}[\s\S]*?allow list:\s*if false;[\s\S]*?incoming\(\)\.lastNumber == existing\(\)\.lastNumber \+ 1[\s\S]*?allow delete:\s*if false;/
-    );
-  });
 });
 
 // Live Firestore Emulator execution suite (activated when FIRESTORE_EMULATOR_HOST is set)
 const emulatorHost = process.env.FIRESTORE_EMULATOR_HOST?.trim();
 if (emulatorHost) {
   const projectId = 'demo-it-helpdesk';
-  const baseUrl = `http://${emulatorHost}/v1/projects/${projectId}/databases/(default)/documents`;
+  const docRoot = `projects/${projectId}/databases/(default)/documents`;
+  const baseUrl = `http://${emulatorHost}/v1/${docRoot}`;
 
   function makeEmulatorJwt(claims: {
     sub: string;
@@ -146,33 +156,271 @@ if (emulatorHost) {
     });
   }
 
-  describe('Firestore Emulator Live Dirty Dozen & Audit Trust Boundary', () => {
-    it('01 & 06: denies unauthenticated ticket read and employee blanket list', async () => {
-      const unauthGet = await fetch(`${baseUrl}/tickets/IT-2026-001`);
-      assert.equal(unauthGet.status, 403);
+  function buildTicketFields(overrides: Record<string, unknown> = {}) {
+    return {
+      id: { stringValue: 'IT-2026-001' },
+      requesterName: { stringValue: 'สมชาย ใจดี' },
+      department: { stringValue: 'บัญชี' },
+      contactInfo: { stringValue: 'ต่อ 104' },
+      category: { stringValue: 'อินเทอร์เน็ต/Wi-Fi มีปัญหา' },
+      urgency: { stringValue: 'ด่วน' },
+      description: { stringValue: 'เชื่อมต่อ Wi-Fi ไม่ได้' },
+      assetTag: { stringValue: 'PC-ACC-001' },
+      status: { stringValue: 'รอดำเนินการ' },
+      resolutionNote: { stringValue: '' },
+      createdByUid: { stringValue: 'emp-uid-1' },
+      createdByEmail: { stringValue: 'employee1@company.co.th' },
+      completedAt: { nullValue: null },
+      ...overrides,
+    };
+  }
 
-      const empList = await fetch(`${baseUrl}/tickets`, {
-        headers: { Authorization: `Bearer ${employeeToken}` },
-      });
-      assert.equal(empList.status, 403);
+  function buildAtomicTicketCommit(
+    ticketId: string,
+    seqNum: number,
+    uid: string,
+    email: string,
+    auditId: string,
+    ticketFieldsOverride: Record<string, unknown> = {},
+    isFirstCounter = false,
+    useClientTimestamp = false
+  ) {
+    const ticketWrite: Record<string, unknown> = {
+      update: {
+        name: `${docRoot}/tickets/${ticketId}`,
+        fields: {
+          ...buildTicketFields({
+            id: { stringValue: ticketId },
+            createdByUid: { stringValue: uid },
+            createdByEmail: { stringValue: email },
+            ...ticketFieldsOverride,
+          }),
+          ...(useClientTimestamp
+            ? {
+                createdAt: { timestampValue: '2020-01-01T00:00:00.000Z' },
+                updatedAt: { timestampValue: '2020-01-01T00:00:00.000Z' },
+              }
+            : {}),
+        },
+      },
+      currentDocument: { exists: false },
+    };
+
+    if (!useClientTimestamp) {
+      ticketWrite.updateTransforms = [
+        { fieldPath: 'createdAt', setToServerValue: 'REQUEST_TIME' },
+        { fieldPath: 'updatedAt', setToServerValue: 'REQUEST_TIME' },
+      ];
+    }
+
+    return [
+      {
+        update: {
+          name: `${docRoot}/counters/tickets`,
+          fields: {
+            lastNumber: { integerValue: String(seqNum) },
+            lastTicketId: { stringValue: ticketId },
+          },
+        },
+        ...(isFirstCounter ? { currentDocument: { exists: false } } : {}),
+        updateTransforms: [{ fieldPath: 'updatedAt', setToServerValue: 'REQUEST_TIME' }],
+      },
+      ticketWrite,
+      {
+        update: {
+          name: `${docRoot}/auditLogs/${auditId}`,
+          fields: {
+            action: { stringValue: 'ticket.created' },
+            targetId: { stringValue: ticketId },
+            actorUid: { stringValue: uid },
+            actorEmail: { stringValue: email },
+            summary: { stringValue: `สร้างใบแจ้งซ่อม ${ticketId}` },
+          },
+        },
+        currentDocument: { exists: false },
+        updateTransforms: [{ fieldPath: 'createdAt', setToServerValue: 'REQUEST_TIME' }],
+      },
+    ];
+  }
+
+  describe('Firestore Emulator Live Dirty Dozen (All 12 Cases) + F-11 & F-09', () => {
+    it('01_unauthenticated_ticket_read: denies unauthenticated ticket read', async () => {
+      const res = await fetch(`${baseUrl}/tickets/IT-2026-001`);
+      assert.equal(res.status, 403);
     });
 
-    it('02 & F-09: denies unverified email ticket create and denies employee forging admin audit events', async () => {
-      const unverifiedCommit = await commitWrites(unverifiedToken, [
+    it('02_unverified_email_ticket_create: denies unverified email ticket creation', async () => {
+      const res = await commitWrites(
+        unverifiedToken,
+        buildAtomicTicketCommit(
+          'IT-2026-001',
+          1,
+          'unverified-uid',
+          'unverified@company.co.th',
+          'aud-02',
+          {},
+          true
+        )
+      );
+      assert.equal(res.status, 403);
+    });
+
+    it('03_spoofed_createdByUid_on_create: denies spoofing createdByUid', async () => {
+      const res = await commitWrites(
+        employeeToken,
+        buildAtomicTicketCommit(
+          'IT-2026-001',
+          1,
+          'emp-uid-1',
+          'employee1@company.co.th',
+          'aud-03',
+          { createdByUid: { stringValue: 'victim-uid' } },
+          true
+        )
+      );
+      assert.equal(res.status, 403);
+    });
+
+    it('04_non_admin_creates_completed_status: denies employee creating completed ticket', async () => {
+      const res = await commitWrites(
+        employeeToken,
+        buildAtomicTicketCommit(
+          'IT-2026-001',
+          1,
+          'emp-uid-1',
+          'employee1@company.co.th',
+          'aud-04',
+          { status: { stringValue: 'เสร็จสิ้น' } },
+          true
+        )
+      );
+      assert.equal(res.status, 403);
+    });
+
+    it('06_non_admin_blanket_list_tickets: denies unfiltered blanket list by employee', async () => {
+      const res = await fetch(`${baseUrl}/tickets`, {
+        headers: { Authorization: `Bearer ${employeeToken}` },
+      });
+      assert.equal(res.status, 403);
+    });
+
+    it('07_shadow_field_injection_on_ticket: denies ghost/shadow fields on ticket', async () => {
+      const res = await commitWrites(
+        employeeToken,
+        buildAtomicTicketCommit(
+          'IT-2026-001',
+          1,
+          'emp-uid-1',
+          'employee1@company.co.th',
+          'aud-07',
+          { isAdminApproved: { booleanValue: true } },
+          true
+        )
+      );
+      assert.equal(res.status, 403);
+    });
+
+    it('08_oversized_description_or_id_poisoning: denies oversized description and invalid ticket ID', async () => {
+      const oversized = await commitWrites(
+        employeeToken,
+        buildAtomicTicketCommit(
+          'IT-2026-001',
+          1,
+          'emp-uid-1',
+          'employee1@company.co.th',
+          'aud-08a',
+          { description: { stringValue: 'x'.repeat(2001) } },
+          true
+        )
+      );
+      assert.equal(oversized.status, 403);
+
+      const poisonedId = await commitWrites(
+        employeeToken,
+        buildAtomicTicketCommit(
+          'IT-bad$id',
+          1,
+          'emp-uid-1',
+          'employee1@company.co.th',
+          'aud-08b',
+          {},
+          true
+        )
+      );
+      assert.equal(poisonedId.status, 403);
+    });
+
+    it('09_client_spoofed_createdAt_timestamp: denies client-supplied createdAt timestamp', async () => {
+      const res = await commitWrites(
+        employeeToken,
+        buildAtomicTicketCommit(
+          'IT-2026-001',
+          1,
+          'emp-uid-1',
+          'employee1@company.co.th',
+          'aud-09',
+          {},
+          true,
+          true
+        )
+      );
+      assert.equal(res.status, 403);
+    });
+
+    it('10_self_escalation_into_admins_collection: denies non-admin writing to /admins', async () => {
+      const res = await commitWrites(employeeToken, [
         {
           update: {
-            name: `projects/${projectId}/databases/(default)/documents/counters/tickets`,
-            fields: { lastNumber: { integerValue: '1' } },
+            name: `${docRoot}/admins/emp-uid-1`,
+            fields: {
+              email: { stringValue: 'employee1@company.co.th' },
+              addedByUid: { stringValue: 'emp-uid-1' },
+            },
           },
+          currentDocument: { exists: false },
+          updateTransforms: [{ fieldPath: 'createdAt', setToServerValue: 'REQUEST_TIME' }],
+        },
+      ]);
+      assert.equal(res.status, 403);
+    });
+
+    it('F-11: blocks orphan counter increment and counter/ticket ID mismatch', async () => {
+      const orphanCounter = await commitWrites(employeeToken, [
+        {
+          update: {
+            name: `${docRoot}/counters/tickets`,
+            fields: {
+              lastNumber: { integerValue: '1' },
+              lastTicketId: { stringValue: 'IT-2026-001' },
+            },
+          },
+          currentDocument: { exists: false },
           updateTransforms: [{ fieldPath: 'updatedAt', setToServerValue: 'REQUEST_TIME' }],
         },
       ]);
-      assert.equal(unverifiedCommit.status, 403);
+      assert.equal(orphanCounter.status, 403);
 
-      const forgedAdminAudit = await commitWrites(employeeToken, [
+      const mismatchedCounter = await commitWrites(employeeToken, [
         {
           update: {
-            name: `projects/${projectId}/databases/(default)/documents/auditLogs/aud-forged-1`,
+            name: `${docRoot}/counters/tickets`,
+            fields: {
+              lastNumber: { integerValue: '1' },
+              lastTicketId: { stringValue: 'IT-2026-009' },
+            },
+          },
+          currentDocument: { exists: false },
+          updateTransforms: [{ fieldPath: 'updatedAt', setToServerValue: 'REQUEST_TIME' }],
+        },
+      ]);
+      assert.equal(mismatchedCounter.status, 403);
+    });
+
+    it('F-09: denies non-admin forging admin audit actions or orphan ticket.created logs', async () => {
+      const forgedWebhookAudit = await commitWrites(employeeToken, [
+        {
+          update: {
+            name: `${docRoot}/auditLogs/aud-forged-1`,
             fields: {
               action: { stringValue: 'webhook.config_updated' },
               targetId: { stringValue: 'webhook' },
@@ -185,12 +433,12 @@ if (emulatorHost) {
           updateTransforms: [{ fieldPath: 'createdAt', setToServerValue: 'REQUEST_TIME' }],
         },
       ]);
-      assert.equal(forgedAdminAudit.status, 403);
+      assert.equal(forgedWebhookAudit.status, 403);
 
-      const forgedTicketCreatedAudit = await commitWrites(employeeToken, [
+      const forgedCreatedAudit = await commitWrites(employeeToken, [
         {
           update: {
-            name: `projects/${projectId}/databases/(default)/documents/auditLogs/aud-forged-2`,
+            name: `${docRoot}/auditLogs/aud-forged-2`,
             fields: {
               action: { stringValue: 'ticket.created' },
               targetId: { stringValue: 'IT-2026-999' },
@@ -203,41 +451,41 @@ if (emulatorHost) {
           updateTransforms: [{ fieldPath: 'createdAt', setToServerValue: 'REQUEST_TIME' }],
         },
       ]);
-      assert.equal(forgedTicketCreatedAudit.status, 403);
+      assert.equal(forgedCreatedAudit.status, 403);
     });
 
-    it('allows atomic ticket + counter + ticket.created audit creation, then allows admin update & blocks immutable audit delete', async () => {
-      const ticketPath = `projects/${projectId}/databases/(default)/documents/tickets/IT-2026-001`;
-      const counterPath = `projects/${projectId}/databases/(default)/documents/counters/tickets`;
-      const auditCreatePath = `projects/${projectId}/databases/(default)/documents/auditLogs/aud-create-001`;
+    it('valid atomic ticket + counter + audit creation succeeds, then enforces 05, 11, 12 and admin lifecycle', async () => {
+      // Valid atomic creation #1
+      const create1 = await commitWrites(
+        employeeToken,
+        buildAtomicTicketCommit(
+          'IT-2026-001',
+          1,
+          'emp-uid-1',
+          'employee1@company.co.th',
+          'aud-create-001',
+          {},
+          true
+        )
+      );
+      assert.equal(create1.status, 200);
 
-      const createRes = await commitWrites(employeeToken, [
+      // F-11: employee cannot create ticket IT-2026-999 with counter IT-2026-002
+      const mismatchTicket = await commitWrites(employeeToken, [
         {
           update: {
-            name: counterPath,
-            fields: { lastNumber: { integerValue: '1' } },
+            name: `${docRoot}/counters/tickets`,
+            fields: {
+              lastNumber: { integerValue: '2' },
+              lastTicketId: { stringValue: 'IT-2026-002' },
+            },
           },
-          currentDocument: { exists: false },
           updateTransforms: [{ fieldPath: 'updatedAt', setToServerValue: 'REQUEST_TIME' }],
         },
         {
           update: {
-            name: ticketPath,
-            fields: {
-              id: { stringValue: 'IT-2026-001' },
-              requesterName: { stringValue: 'สมชาย ใจดี' },
-              department: { stringValue: 'บัญชี' },
-              contactInfo: { stringValue: 'ต่อ 104' },
-              category: { stringValue: 'อินเทอร์เน็ต/Wi-Fi มีปัญหา' },
-              urgency: { stringValue: 'ด่วน' },
-              description: { stringValue: 'เชื่อมต่อ Wi-Fi ไม่ได้' },
-              assetTag: { stringValue: 'PC-ACC-001' },
-              status: { stringValue: 'รอดำเนินการ' },
-              resolutionNote: { stringValue: '' },
-              createdByUid: { stringValue: 'emp-uid-1' },
-              createdByEmail: { stringValue: 'employee1@company.co.th' },
-              completedAt: { nullValue: null },
-            },
+            name: `${docRoot}/tickets/IT-2026-999`,
+            fields: buildTicketFields({ id: { stringValue: 'IT-2026-999' } }),
           },
           currentDocument: { exists: false },
           updateTransforms: [
@@ -245,47 +493,96 @@ if (emulatorHost) {
             { fieldPath: 'updatedAt', setToServerValue: 'REQUEST_TIME' },
           ],
         },
+      ]);
+      assert.equal(mismatchTicket.status, 403);
+
+      // 05_non_admin_updates_ticket_status: employee cannot update own ticket status
+      const empUpdate = await fetch(
+        `${baseUrl}/tickets/IT-2026-001?updateMask.fieldPaths=status`,
+        {
+          method: 'PATCH',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${employeeToken}`,
+          },
+          body: JSON.stringify({
+            fields: { status: { stringValue: 'กำลังซ่อม' } },
+          }),
+        }
+      );
+      assert.equal(empUpdate.status, 403);
+
+      // 11_mutating_immutable_createdByUid_or_createdAt: even admin cannot mutate createdByUid
+      const adminMutateImmutable = await commitWrites(adminToken, [
         {
           update: {
-            name: auditCreatePath,
-            fields: {
-              action: { stringValue: 'ticket.created' },
-              targetId: { stringValue: 'IT-2026-001' },
-              actorUid: { stringValue: 'emp-uid-1' },
-              actorEmail: { stringValue: 'employee1@company.co.th' },
-              summary: { stringValue: 'สร้างใบแจ้งซ่อม IT-2026-001' },
-            },
+            name: `${docRoot}/tickets/IT-2026-001`,
+            fields: buildTicketFields({ createdByUid: { stringValue: 'other-uid' } }),
           },
-          currentDocument: { exists: false },
-          updateTransforms: [{ fieldPath: 'createdAt', setToServerValue: 'REQUEST_TIME' }],
+          updateMask: { fieldPaths: ['createdByUid', 'updatedAt'] },
+          updateTransforms: [{ fieldPath: 'updatedAt', setToServerValue: 'REQUEST_TIME' }],
         },
       ]);
-      assert.equal(createRes.status, 200);
+      assert.equal(adminMutateImmutable.status, 403);
 
-      // 10: Employee cannot self-escalate into /admins
-      const selfEscalate = await commitWrites(employeeToken, [
-        {
-          update: {
-            name: `projects/${projectId}/databases/(default)/documents/admins/emp-uid-1`,
-            fields: {
-              email: { stringValue: 'employee1@company.co.th' },
-              addedByUid: { stringValue: 'emp-uid-1' },
-            },
-          },
-          currentDocument: { exists: false },
-          updateTransforms: [{ fieldPath: 'createdAt', setToServerValue: 'REQUEST_TIME' }],
-        },
-      ]);
-      assert.equal(selfEscalate.status, 403);
-
-      // 12: Employee cannot delete ticket
+      // 12_non_admin_deletes_ticket: employee cannot delete ticket
       const empDelete = await fetch(`${baseUrl}/tickets/IT-2026-001`, {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${employeeToken}` },
       });
       assert.equal(empDelete.status, 403);
 
-      // Admin cannot delete immutable auditLogs
+      // Valid admin update + atomic ticket.updated audit succeeds
+      const adminUpdate = await commitWrites(adminToken, [
+        {
+          update: {
+            name: `${docRoot}/tickets/IT-2026-001`,
+            fields: buildTicketFields({
+              status: { stringValue: 'กำลังซ่อม' },
+              resolutionNote: { stringValue: 'กำลังตรวจสอบ' },
+            }),
+          },
+          updateMask: { fieldPaths: ['status', 'resolutionNote', 'completedAt', 'updatedAt'] },
+          updateTransforms: [{ fieldPath: 'updatedAt', setToServerValue: 'REQUEST_TIME' }],
+        },
+        {
+          update: {
+            name: `${docRoot}/auditLogs/aud-upd-001`,
+            fields: {
+              action: { stringValue: 'ticket.updated' },
+              targetId: { stringValue: 'IT-2026-001' },
+              actorUid: { stringValue: 'admin-uid-1' },
+              actorEmail: { stringValue: 'niphan1000@gmail.com' },
+              summary: { stringValue: 'อัปเดตสถานะ IT-2026-001' },
+            },
+          },
+          currentDocument: { exists: false },
+          updateTransforms: [{ fieldPath: 'createdAt', setToServerValue: 'REQUEST_TIME' }],
+        },
+      ]);
+      assert.equal(adminUpdate.status, 200);
+
+      // Valid admin delete + atomic ticket.deleted audit succeeds
+      const adminDelete = await commitWrites(adminToken, [
+        { delete: `${docRoot}/tickets/IT-2026-001` },
+        {
+          update: {
+            name: `${docRoot}/auditLogs/aud-del-001`,
+            fields: {
+              action: { stringValue: 'ticket.deleted' },
+              targetId: { stringValue: 'IT-2026-001' },
+              actorUid: { stringValue: 'admin-uid-1' },
+              actorEmail: { stringValue: 'niphan1000@gmail.com' },
+              summary: { stringValue: 'ลบใบแจ้งซ่อม IT-2026-001' },
+            },
+          },
+          currentDocument: { exists: false },
+          updateTransforms: [{ fieldPath: 'createdAt', setToServerValue: 'REQUEST_TIME' }],
+        },
+      ]);
+      assert.equal(adminDelete.status, 200);
+
+      // Immutable audit log cannot be deleted even by admin
       const adminDeleteAudit = await fetch(`${baseUrl}/auditLogs/aud-create-001`, {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${adminToken}` },

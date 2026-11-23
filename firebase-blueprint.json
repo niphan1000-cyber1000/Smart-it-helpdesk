@@ -126,13 +126,20 @@
           "type": "integer",
           "description": "Last allocated sequential ticket number"
         },
+        "lastTicketId": {
+          "type": "string",
+          "description": "Ticket ID allocated by this counter increment (e.g. IT-2026-001)",
+          "minLength": 3,
+          "maxLength": 32,
+          "pattern": "^IT-[0-9]{4}-[0-9]{3,6}$"
+        },
         "updatedAt": {
           "type": "string",
           "format": "date-time",
           "description": "Server timestamp of the last allocation"
         }
       },
-      "required": ["lastNumber", "updatedAt"]
+      "required": ["lastNumber", "lastTicketId", "updatedAt"]
     },
     "AiResolution": {
       "title": "AiResolution",

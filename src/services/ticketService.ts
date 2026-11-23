@@ -221,16 +221,8 @@ export async function createTicketInFirestore(
       const currentLast = counterSnap.exists()
         ? Number(counterSnap.data().lastNumber ?? 0)
         : 0;
-      let nextNumber = currentLast + 1;
-      let candidateId = formatTicketId(year, nextNumber);
-
-      // Guard against collision if demo tickets were seeded earlier
-      let existingSnap = await transaction.get(doc(db, 'tickets', candidateId));
-      while (existingSnap.exists()) {
-        nextNumber += 1;
-        candidateId = formatTicketId(year, nextNumber);
-        existingSnap = await transaction.get(doc(db, 'tickets', candidateId));
-      }
+      const nextNumber = currentLast + 1;
+      const candidateId = formatTicketId(year, nextNumber);
 
       const ticketPayload: Record<string, unknown> = {
         id: candidateId,
@@ -256,6 +248,7 @@ export async function createTicketInFirestore(
 
       transaction.set(counterRef, {
         lastNumber: nextNumber,
+        lastTicketId: candidateId,
         updatedAt: serverTimestamp(),
       });
       transaction.set(doc(db, 'tickets', candidateId), ticketPayload);
@@ -393,9 +386,16 @@ export async function seedDemoTicketsToFirestore(user: User): Promise<void> {
     currentMax = 0;
   }
 
+  const nextMaxNumber = Math.max(currentMax, demoTickets.length);
+  const lastSeededId =
+    nextMaxNumber === demoTickets.length
+      ? demoTickets[demoTickets.length - 1].id
+      : formatTicketId(new Date().getFullYear(), nextMaxNumber);
+
   const batch = writeBatch(db);
   batch.set(counterRef, {
-    lastNumber: Math.max(currentMax, demoTickets.length),
+    lastNumber: nextMaxNumber,
+    lastTicketId: lastSeededId,
     updatedAt: serverTimestamp(),
   });
 
