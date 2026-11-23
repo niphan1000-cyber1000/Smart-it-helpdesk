@@ -1,10 +1,14 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import net from 'node:net';
 import {
   createPinnedLookup,
+  createRateLimiter,
   isPrivateOrBlockedIp,
   parseFirestoreTicketDocument,
   postJsonWithPinnedIp,
+  RedisRestRateLimiter,
+  RedisTcpRateLimiter,
   SlidingWindowRateLimiter,
   validateWebhookUrlStructure,
 } from '../server/security.ts';
@@ -231,5 +235,129 @@ describe('Demo Seed Counter Plan (F-14)', () => {
     assert.deepEqual(aheadPlan, {
       shouldWriteCounter: false,
     });
+  });
+});
+
+describe('Distributed Shared Rate Limiter (F-13)', () => {
+  it('selects redis-tcp, redis-rest, or memory backend via createRateLimiter', () => {
+    assert.equal(
+      createRateLimiter({
+        maxRequests: 5,
+        windowMs: 60_000,
+        redisUrl: 'redis://:secret@127.0.0.1:6379/0',
+      }).backend,
+      'redis-tcp'
+    );
+    assert.equal(
+      createRateLimiter({
+        maxRequests: 5,
+        windowMs: 60_000,
+        redisRestUrl: 'https://example-redis.upstash.io',
+        redisRestToken: 'token-123',
+      }).backend,
+      'redis-rest'
+    );
+    assert.equal(
+      createRateLimiter({
+        maxRequests: 5,
+        windowMs: 60_000,
+      }).backend,
+      'memory'
+    );
+  });
+
+  it('executes AUTH + EVAL sliding-window commands over RESP2 TCP and falls back cleanly on connection failure', async () => {
+    let evalCallCount = 0;
+    let sawAuth = false;
+
+    const server = net.createServer((socket) => {
+      let buffer = '';
+      socket.on('data', (chunk) => {
+        buffer += chunk.toString('utf-8');
+        if (buffer.includes('AUTH') && buffer.includes('EVAL')) {
+          if (buffer.includes('secretpass')) {
+            sawAuth = true;
+          }
+          evalCallCount += 1;
+          const reply =
+            evalCallCount <= 2
+              ? `+OK\r\n*3\r\n:1\r\n:${2 - evalCallCount}\r\n:0\r\n`
+              : `+OK\r\n*3\r\n:0\r\n:0\r\n:42\r\n`;
+          socket.write(reply);
+          buffer = '';
+        }
+      });
+    });
+
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const addr = server.address() as net.AddressInfo;
+
+    try {
+      const limiter = new RedisTcpRateLimiter({
+        redisUrl: `redis://:secretpass@127.0.0.1:${addr.port}`,
+        maxRequests: 2,
+        windowMs: 60_000,
+        keyPrefix: 'test:',
+      });
+
+      const r1 = await limiter.check('user-a', 1_000_000);
+      assert.equal(r1.allowed, true);
+      assert.equal(r1.remaining, 1);
+
+      const r2 = await limiter.check('user-a', 1_000_500);
+      assert.equal(r2.allowed, true);
+      assert.equal(r2.remaining, 0);
+
+      const r3 = await limiter.check('user-a', 1_001_000);
+      assert.equal(r3.allowed, false);
+      assert.equal(r3.retryAfterSeconds, 42);
+      assert.equal(sawAuth, true);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+
+    // Graceful fallback to in-memory limiter if Redis server becomes unreachable
+    const fallbackLimiter = new RedisTcpRateLimiter({
+      redisUrl: `redis://127.0.0.1:${addr.port}`,
+      maxRequests: 1,
+      windowMs: 60_000,
+      timeoutMs: 300,
+    });
+    const fb1 = await fallbackLimiter.check('user-fb', 2_000_000);
+    const fb2 = await fallbackLimiter.check('user-fb', 2_000_100);
+    assert.equal(fb1.allowed, true);
+    assert.equal(fb2.allowed, false);
+  });
+
+  it('supports Upstash-compatible Redis REST EVAL responses', async () => {
+    const originalFetch = globalThis.fetch;
+    let callNum = 0;
+    globalThis.fetch = (async () => {
+      callNum += 1;
+      const result = callNum === 1 ? [1, 4, 0] : [0, 0, 15];
+      return new Response(JSON.stringify({ result }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof fetch;
+
+    try {
+      const limiter = new RedisRestRateLimiter({
+        restUrl: 'https://redis-rest.example.com',
+        restToken: 'secret-token',
+        maxRequests: 5,
+        windowMs: 60_000,
+      });
+
+      const first = await limiter.check('rest-user', 1000);
+      assert.equal(first.allowed, true);
+      assert.equal(first.remaining, 4);
+
+      const second = await limiter.check('rest-user', 2000);
+      assert.equal(second.allowed, false);
+      assert.equal(second.retryAfterSeconds, 15);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });

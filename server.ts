@@ -6,9 +6,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { GoogleGenAI, Type } from '@google/genai';
 import {
+  createRateLimiter,
   parseFirestoreTicketDocument,
   postJsonWithPinnedIp,
-  SlidingWindowRateLimiter,
   validateWebhookUrlAndResolve,
 } from './server/security.ts';
 
@@ -80,11 +80,31 @@ const ALLOWED_WEBHOOK_HOSTS = (process.env.WEBHOOK_ALLOWED_HOSTS || '')
   .map((s) => s.trim().toLowerCase())
   .filter(Boolean);
 
-// Sliding-window rate limiters (15-minute window)
+// Sliding-window rate limiters (15-minute window) — uses REDIS_URL or REDIS_REST_URL when configured, falls back to memory
 const FIFTEEN_MIN_MS = 15 * 60 * 1000;
-const aiUidLimiter = new SlidingWindowRateLimiter(15, FIFTEEN_MIN_MS);
-const aiIpLimiter = new SlidingWindowRateLimiter(30, FIFTEEN_MIN_MS);
-const webhookUidLimiter = new SlidingWindowRateLimiter(10, FIFTEEN_MIN_MS);
+const redisLimiterEnv = {
+  redisUrl: process.env.REDIS_URL,
+  redisRestUrl: process.env.REDIS_REST_URL,
+  redisRestToken: process.env.REDIS_REST_TOKEN,
+};
+const aiUidLimiter = createRateLimiter({
+  maxRequests: 15,
+  windowMs: FIFTEEN_MIN_MS,
+  keyPrefix: 'ithelpdesk:ai:uid:',
+  ...redisLimiterEnv,
+});
+const aiIpLimiter = createRateLimiter({
+  maxRequests: 30,
+  windowMs: FIFTEEN_MIN_MS,
+  keyPrefix: 'ithelpdesk:ai:ip:',
+  ...redisLimiterEnv,
+});
+const webhookUidLimiter = createRateLimiter({
+  maxRequests: 10,
+  windowMs: FIFTEEN_MIN_MS,
+  keyPrefix: 'ithelpdesk:webhook:uid:',
+  ...redisLimiterEnv,
+});
 
 let runtimeWebhookConfig: { url: string; type: WebhookType } | null = null;
 
@@ -398,8 +418,8 @@ async function writeBackendAuditLog(
   }
 }
 
-function enforceAiRateLimit(user: VerifiedUser, req: Request, res: Response): boolean {
-  const uidCheck = aiUidLimiter.check(`ai:uid:${user.uid}`);
+async function enforceAiRateLimit(user: VerifiedUser, req: Request, res: Response): Promise<boolean> {
+  const uidCheck = await aiUidLimiter.check(user.uid);
   if (!uidCheck.allowed) {
     res.setHeader('Retry-After', String(uidCheck.retryAfterSeconds));
     res.status(429).json({
@@ -408,7 +428,7 @@ function enforceAiRateLimit(user: VerifiedUser, req: Request, res: Response): bo
     return false;
   }
 
-  const ipCheck = aiIpLimiter.check(`ai:ip:${getClientIp(req)}`);
+  const ipCheck = await aiIpLimiter.check(getClientIp(req));
   if (!ipCheck.allowed) {
     res.setHeader('Retry-After', String(ipCheck.retryAfterSeconds));
     res.status(429).json({
@@ -623,7 +643,7 @@ async function startServer() {
       return;
     }
 
-    if (!enforceAiRateLimit(user, req, res)) return;
+    if (!(await enforceAiRateLimit(user, req, res))) return;
 
     const category = typeof req.body?.category === 'string' ? req.body.category.trim().slice(0, 100) : '';
     const description = typeof req.body?.description === 'string' ? req.body.description.trim().slice(0, 2000) : '';
@@ -715,7 +735,7 @@ async function startServer() {
       return;
     }
 
-    if (!enforceAiRateLimit(user, req, res)) return;
+    if (!(await enforceAiRateLimit(user, req, res))) return;
 
     const ticketId = typeof req.body?.ticketId === 'string' ? req.body.ticketId.trim().slice(0, 32) : '';
     const category = typeof req.body?.category === 'string' ? req.body.category.trim().slice(0, 100) : '';
@@ -937,7 +957,7 @@ async function startServer() {
       return;
     }
 
-    const rateCheck = webhookUidLimiter.check(`webhook:uid:${user.uid}`);
+    const rateCheck = await webhookUidLimiter.check(user.uid);
     if (!rateCheck.allowed) {
       res.setHeader('Retry-After', String(rateCheck.retryAfterSeconds));
       res.status(429).json({
@@ -1024,7 +1044,14 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`IT Helpdesk server running at http://localhost:${PORT}`);
+    console.log(
+      `IT Helpdesk server running at http://localhost:${PORT} (rateLimiter=${aiUidLimiter.backend})`
+    );
+    if (process.env.NODE_ENV === 'production' && aiUidLimiter.backend === 'memory') {
+      console.warn(
+        '[Security] Rate limiter is using single-instance in-memory storage; configure REDIS_URL or REDIS_REST_URL for multi-instance Cloud Run scaling.'
+      );
+    }
   });
 }
 
