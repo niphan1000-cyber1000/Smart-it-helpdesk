@@ -588,6 +588,80 @@ if (emulatorHost) {
         headers: { Authorization: `Bearer ${adminToken}` },
       });
       assert.equal(adminDeleteAudit.status, 403);
+
+      // F-14: Admin demo seed with mismatched lastTicketId IT-2026-001 for lastNumber=5 must fail
+      const badSeed = await commitWrites(adminToken, [
+        {
+          update: {
+            name: `${docRoot}/counters/tickets`,
+            fields: {
+              lastNumber: { integerValue: '5' },
+              lastTicketId: { stringValue: 'IT-2026-001' },
+            },
+          },
+          updateTransforms: [{ fieldPath: 'updatedAt', setToServerValue: 'REQUEST_TIME' }],
+        },
+        {
+          update: {
+            name: `${docRoot}/tickets/IT-2026-005`,
+            fields: buildTicketFields({
+              id: { stringValue: 'IT-2026-005' },
+              createdByUid: { stringValue: 'admin-uid-1' },
+              createdByEmail: { stringValue: 'niphan1000@gmail.com' },
+            }),
+          },
+          currentDocument: { exists: false },
+          updateTransforms: [
+            { fieldPath: 'createdAt', setToServerValue: 'REQUEST_TIME' },
+            { fieldPath: 'updatedAt', setToServerValue: 'REQUEST_TIME' },
+          ],
+        },
+      ]);
+      assert.equal(badSeed.status, 403);
+
+      // F-14: Valid admin demo seed with lastNumber=5 and lastTicketId=IT-2026-005 succeeds
+      const goodSeed = await commitWrites(adminToken, [
+        {
+          update: {
+            name: `${docRoot}/counters/tickets`,
+            fields: {
+              lastNumber: { integerValue: '5' },
+              lastTicketId: { stringValue: 'IT-2026-005' },
+            },
+          },
+          updateTransforms: [{ fieldPath: 'updatedAt', setToServerValue: 'REQUEST_TIME' }],
+        },
+        {
+          update: {
+            name: `${docRoot}/tickets/IT-2026-005`,
+            fields: buildTicketFields({
+              id: { stringValue: 'IT-2026-005' },
+              createdByUid: { stringValue: 'admin-uid-1' },
+              createdByEmail: { stringValue: 'niphan1000@gmail.com' },
+            }),
+          },
+          currentDocument: { exists: false },
+          updateTransforms: [
+            { fieldPath: 'createdAt', setToServerValue: 'REQUEST_TIME' },
+            { fieldPath: 'updatedAt', setToServerValue: 'REQUEST_TIME' },
+          ],
+        },
+        {
+          update: {
+            name: `${docRoot}/auditLogs/aud-seed-001`,
+            fields: {
+              action: { stringValue: 'admin.demo_seeded' },
+              targetId: { stringValue: 'tickets' },
+              actorUid: { stringValue: 'admin-uid-1' },
+              actorEmail: { stringValue: 'niphan1000@gmail.com' },
+              summary: { stringValue: 'เพิ่มข้อมูลตัวอย่างลงฐานข้อมูล Firestore' },
+            },
+          },
+          currentDocument: { exists: false },
+          updateTransforms: [{ fieldPath: 'createdAt', setToServerValue: 'REQUEST_TIME' }],
+        },
+      ]);
+      assert.equal(goodSeed.status, 200);
     });
   });
 }

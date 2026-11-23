@@ -185,9 +185,11 @@ service cloud.firestore {
         && incoming().updatedAt == request.time
         && (incoming().status == 'รอดำเนินการ' || isAdmin())
         && existsAfter(/databases/$(database)/documents/counters/tickets)
-        && getAfter(/databases/$(database)/documents/counters/tickets).data.updatedAt == request.time
         && (
-          getAfter(/databases/$(database)/documents/counters/tickets).data.lastTicketId == ticketId
+          (
+            getAfter(/databases/$(database)/documents/counters/tickets).data.updatedAt == request.time
+            && getAfter(/databases/$(database)/documents/counters/tickets).data.lastTicketId == ticketId
+          )
           || isAdmin()
         );
 

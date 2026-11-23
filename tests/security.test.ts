@@ -9,6 +9,8 @@ import {
   validateWebhookUrlStructure,
 } from '../server/security.ts';
 import { getPermissionsForRole, hasPermission } from '../src/types/ticket.ts';
+import { createInitialMockTickets } from '../src/data/mockTickets.ts';
+import { resolveSeedCounterPlan } from '../src/utils/ticketCounter.ts';
 
 describe('SlidingWindowRateLimiter', () => {
   it('allows requests up to maxRequests and blocks excess until window expires', () => {
@@ -203,5 +205,31 @@ describe('Standardized RBAC Permissions', () => {
     assert.equal(hasPermission(adminPerms, 'ai:diagnostic'), true);
     assert.equal(hasPermission(adminPerms, 'webhook:manage'), true);
     assert.equal(hasPermission(adminPerms, 'audit:read'), true);
+  });
+});
+
+describe('Demo Seed Counter Plan (F-14)', () => {
+  it('picks highest sequence ticket IT-2026-005 regardless of descending mockTickets order and avoids overwriting ahead counters', () => {
+    const mocks = createInitialMockTickets();
+    assert.equal(mocks[mocks.length - 1].id, 'IT-2026-001');
+
+    const initialPlan = resolveSeedCounterPlan(mocks, null);
+    assert.deepEqual(initialPlan, {
+      shouldWriteCounter: true,
+      lastNumber: 5,
+      lastTicketId: 'IT-2026-005',
+    });
+
+    const partialPlan = resolveSeedCounterPlan(mocks, 3);
+    assert.deepEqual(partialPlan, {
+      shouldWriteCounter: true,
+      lastNumber: 5,
+      lastTicketId: 'IT-2026-005',
+    });
+
+    const aheadPlan = resolveSeedCounterPlan(mocks, 8);
+    assert.deepEqual(aheadPlan, {
+      shouldWriteCounter: false,
+    });
   });
 });

@@ -15,6 +15,7 @@ import {
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from '../firebase';
 import { createInitialMockTickets } from '../data/mockTickets';
+import { formatTicketId, resolveSeedCounterPlan } from '../utils/ticketCounter';
 import {
   AuditAction,
   AuditLogEntry,
@@ -80,10 +81,6 @@ function mapDocToAuditLog(id: string, data: Record<string, unknown>): AuditLogEn
     summary: String(data.summary ?? ''),
     createdAt: toIsoString(data.createdAt),
   };
-}
-
-function formatTicketId(year: number, seq: number): string {
-  return `IT-${year}-${String(seq).padStart(3, '0')}`;
 }
 
 function makeAuditId(): string {
@@ -375,62 +372,62 @@ export async function logAiSelfResolutionInFirestore(
 export async function seedDemoTicketsToFirestore(user: User): Promise<void> {
   const demoTickets = createInitialMockTickets();
   const counterRef = doc(db, 'counters', 'tickets');
-  let currentMax = 0;
 
   try {
-    const counterSnap = await getDoc(counterRef);
-    if (counterSnap.exists()) {
-      currentMax = Number(counterSnap.data().lastNumber ?? 0);
-    }
-  } catch {
-    currentMax = 0;
-  }
+    await runTransaction(db, async (tx) => {
+      const counterSnap = await tx.get(counterRef);
+      const existingLastNumber = counterSnap.exists()
+        ? Number(counterSnap.data().lastNumber ?? 0)
+        : null;
 
-  const nextMaxNumber = Math.max(currentMax, demoTickets.length);
-  const lastSeededId =
-    nextMaxNumber === demoTickets.length
-      ? demoTickets[demoTickets.length - 1].id
-      : formatTicketId(new Date().getFullYear(), nextMaxNumber);
+      const plan = resolveSeedCounterPlan(demoTickets, existingLastNumber);
 
-  const batch = writeBatch(db);
-  batch.set(counterRef, {
-    lastNumber: nextMaxNumber,
-    lastTicketId: lastSeededId,
-    updatedAt: serverTimestamp(),
-  });
+      const missingDemoTickets: typeof demoTickets = [];
+      for (const ticket of demoTickets) {
+        const docRef = doc(db, 'tickets', ticket.id);
+        const existingSnap = await tx.get(docRef);
+        if (!existingSnap.exists()) {
+          missingDemoTickets.push(ticket);
+        }
+      }
 
-  for (const ticket of demoTickets) {
-    const docRef = doc(db, 'tickets', ticket.id);
-    batch.set(docRef, {
-      id: ticket.id,
-      requesterName: ticket.requesterName.slice(0, 100),
-      department: ticket.department,
-      contactInfo: ticket.contactInfo.slice(0, 120),
-      category: ticket.category,
-      urgency: ticket.urgency,
-      description: ticket.description.slice(0, 2000),
-      assetTag: ticket.assetTag.slice(0, 64),
-      status: ticket.status,
-      resolutionNote: ticket.resolutionNote.slice(0, 2000),
-      createdByUid: user.uid,
-      createdByEmail: user.email || BOOTSTRAPPED_ADMIN_EMAIL,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-      completedAt: ticket.status === 'เสร็จสิ้น' ? serverTimestamp() : null,
+      if (plan.shouldWriteCounter && plan.lastNumber && plan.lastTicketId) {
+        tx.set(counterRef, {
+          lastNumber: plan.lastNumber,
+          lastTicketId: plan.lastTicketId,
+          updatedAt: serverTimestamp(),
+        });
+      }
+
+      for (const ticket of missingDemoTickets) {
+        tx.set(doc(db, 'tickets', ticket.id), {
+          id: ticket.id,
+          requesterName: ticket.requesterName.slice(0, 100),
+          department: ticket.department,
+          contactInfo: ticket.contactInfo.slice(0, 120),
+          category: ticket.category,
+          urgency: ticket.urgency,
+          description: ticket.description.slice(0, 2000),
+          assetTag: ticket.assetTag.slice(0, 64),
+          status: ticket.status,
+          resolutionNote: ticket.resolutionNote.slice(0, 2000),
+          createdByUid: user.uid,
+          createdByEmail: user.email || BOOTSTRAPPED_ADMIN_EMAIL,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+          completedAt: ticket.status === 'เสร็จสิ้น' ? serverTimestamp() : null,
+        });
+      }
+
+      tx.set(doc(db, 'auditLogs', makeAuditId()), {
+        action: 'admin.demo_seeded',
+        targetId: 'tickets',
+        actorUid: user.uid,
+        actorEmail: user.email || '',
+        summary: `เพิ่มข้อมูลตัวอย่าง ${missingDemoTickets.length} รายการลงฐานข้อมูล Firestore`,
+        createdAt: serverTimestamp(),
+      });
     });
-  }
-
-  batch.set(doc(db, 'auditLogs', makeAuditId()), {
-    action: 'admin.demo_seeded',
-    targetId: 'tickets',
-    actorUid: user.uid,
-    actorEmail: user.email || '',
-    summary: `เพิ่มข้อมูลตัวอย่าง ${demoTickets.length} รายการลงฐานข้อมูล Firestore`,
-    createdAt: serverTimestamp(),
-  });
-
-  try {
-    await batch.commit();
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, 'tickets');
   }
